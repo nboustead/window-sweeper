@@ -35,7 +35,7 @@ for ($i = 0; $i -lt $script:KnownApps.Count; $i++) { $script:AppOrder[$script:Kn
 # Busy/Info/Explorer placeholder) - what Get-CountsSummary tallies per app.
 # Word adds Document/ProtectedView in Phase 2; Chrome adds Tab/BrowserWindow
 # in Phase 3.
-$script:CountableRowTypes = @('Workbook', 'Inspector', 'Document', 'ProtectedView')
+$script:CountableRowTypes = @('Workbook', 'Inspector', 'Document', 'ProtectedView', 'Tab', 'BrowserWindow')
 
 # v0.4 Phase 0: generic action routing, keyed "App|RowType" -> the op names
 # and activation style for that combination. Invoke-RowSaveClose/
@@ -53,6 +53,8 @@ $script:ActionRouting = @{
     'Word|ProtectedView'  = @{ SaveCloseOp = $null; CloseOp = 'WordProtectedViewClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
     'Outlook|Inspector'   = @{ SaveCloseOp = 'OutlookSaveClose'; CloseOp = 'OutlookClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
     'Outlook|Explorer'    = @{ SaveCloseOp = $null; CloseOp = 'ExplorerClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+    'Chrome|Tab'          = @{ SaveCloseOp = $null; CloseOp = 'ChromeTabClose'; SaveAsOp = $null; ActivateStyle = 'CdpActivate' }
+    'Chrome|BrowserWindow'= @{ SaveCloseOp = $null; CloseOp = 'ChromeWindowClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
 }
 
 function Get-RoutingEntry {
@@ -113,8 +115,20 @@ public class SweeperWin32
     [DllImport("oleacc.dll")]
     public static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint id, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] ref object ppv);
 
+    // v0.4 Phase 3: Chrome window-fallback close (WM_CLOSE, fire-and-forget
+    // - PostMessage never blocks on the target's message pump the way
+    // SendMessage would) and liveness check. SetLastError=true (Sol MAJOR)
+    // so a $false return can be paired with Marshal.GetLastWin32Error() on
+    // the PowerShell side instead of silently reporting success.
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
     public const int SW_RESTORE = 9;
     public const uint WM_NULL = 0x0000;
+    public const uint WM_CLOSE = 0x0010;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
     private const uint OBJID_NATIVEOM = 0xFFFFFFF0;
 
@@ -177,7 +191,11 @@ function Initialize-StateDir {
 }
 
 function Get-DefaultSettings {
-    return [PSCustomObject]@{ selectedApps = @($script:KnownApps); confirmDiscard = $true; keepOnTop = $true }
+    # chromeDebugPorts default EMPTY (Sol P1) - the CDP path is config-gated,
+    # never automatic; Nick's :9223 DealerCONNECT Chrome is a live
+    # automation surface for ~9 other tools and must never be probed
+    # uninvited. No UI control in v0.4 - README documents the manual edit.
+    return [PSCustomObject]@{ selectedApps = @($script:KnownApps); confirmDiscard = $true; keepOnTop = $true; chromeDebugPorts = @() }
 }
 
 # v0.4 Phase 0: selectedApps (string array) replaces the old defaultFilter
@@ -223,6 +241,18 @@ function Get-Settings {
         # selectedApps can still be carrying a stale defaultFilter alongside
         # it, and that must not survive to the next load either.
         if ($hasDefaultFilter) { $needsRewrite = $true }
+        # chromeDebugPorts: array-only, ints only (1-65535), same discipline
+        # as selectedApps - anything else (missing, not an array, non-numeric
+        # entries) leaves the Get-DefaultSettings empty-array default in
+        # place rather than guessing at a port to probe.
+        if ($obj.PSObject.Properties.Match('chromeDebugPorts').Count -gt 0 -and ($obj.chromeDebugPorts -is [System.Array])) {
+            $ports = @()
+            foreach ($p in $obj.chromeDebugPorts) {
+                $parsedPort = 0
+                if ([int]::TryParse("$p", [ref]$parsedPort) -and $parsedPort -gt 0 -and $parsedPort -le 65535) { $ports += $parsedPort }
+            }
+            $result.chromeDebugPorts = @($ports | Select-Object -Unique)
+        }
         if ($obj.PSObject.Properties.Match('confirmDiscard').Count -gt 0) {
             $result.confirmDiscard = [bool]$obj.confirmDiscard
         }
@@ -794,6 +824,96 @@ $script:WorkerScript = {
         return $exp
     }
 
+    # v0.4 Phase 3: minimal CDP HTTP client. HttpWebRequest (not
+    # Invoke-WebRequest) so Timeout/Proxy are controlled precisely - a call
+    # that must stay fast and silent has no use for a progress bar or the
+    # cmdlet's extra parsing overhead. 2s timeout and no proxy per plan.
+    # These are HTTP-only, no COM - never launches or touches anything
+    # unless the caller already resolved a real port/id.
+    function Invoke-ChromeCdpGet {
+        param([string]$Url, [int]$TimeoutMs = 2000)
+        $resp = $null
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($Url)
+            $req.Method = 'GET'
+            $req.Timeout = $TimeoutMs
+            $req.Proxy = $null
+            $resp = $req.GetResponse()
+            $stream = $resp.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            $reader.Dispose()
+            return @{ Ok = $true; StatusCode = [int]$resp.StatusCode; Body = $body }
+        } catch [System.Net.WebException] {
+            $statusCode = 0
+            $body = ''
+            try {
+                if ($_.Exception.Response) {
+                    $statusCode = [int]$_.Exception.Response.StatusCode
+                    $errStream = $_.Exception.Response.GetResponseStream()
+                    $errReader = New-Object System.IO.StreamReader($errStream)
+                    $body = $errReader.ReadToEnd()
+                    $errReader.Dispose()
+                }
+            } catch {}
+            return @{ Ok = $false; StatusCode = $statusCode; Body = $body; Message = $_.Exception.Message }
+        } catch {
+            return @{ Ok = $false; StatusCode = 0; Body = ''; Message = $_.Exception.Message }
+        } finally {
+            if ($resp) { try { $resp.Close() } catch {} }
+        }
+    }
+
+    # Filters strictly to type='page' (panel P2 blocker) - extension
+    # service workers/background pages otherwise appear as fake tabs.
+    function Get-ChromeCdpPages {
+        param([int]$Port)
+        $r = Invoke-ChromeCdpGet -Url "http://127.0.0.1:$Port/json/list"
+        if (-not $r.Ok) { return @() }
+        $parsed = $null
+        try { $parsed = $r.Body | ConvertFrom-Json } catch { return @() }
+        if (-not $parsed) { return @() }
+        $items = @($parsed)
+        # Defensive consistency check: PowerShell 5.1's ConvertFrom-Json was
+        # observed, rarely and non-deterministically during testing, to
+        # collapse a genuine N-element JSON array into a single merged
+        # object whose properties become space-joined concatenations of
+        # every element's value (root cause not pinned down - reproduced
+        # with byte-identical input succeeding in one process and failing
+        # in another). PowerShell's `-eq` array-filter semantics would then
+        # let that single garbled object slip through a `.type -eq 'page'`
+        # filter. A raw substring count of `"id":` occurrences is a cheap,
+        # independent cross-check; a mismatch means the parse is not
+        # trustworthy - fail closed to zero rows (a merged/garbled id would
+        # only ever 404 gracefully on close/activate anyway, since Chrome
+        # tabs carry no data-loss risk, but a wrong on-screen count/title is
+        # still worth never showing).
+        $rawIdCount = ([regex]::Matches($r.Body, '"id"\s*:')).Count
+        if ($items.Count -ne $rawIdCount) { return @() }
+        return @($items | Where-Object { $_.type -eq 'page' })
+    }
+
+    # v0.4 Phase 3 hardening (Sol): Chrome_WidgetWin_1 is NOT exclusive to
+    # Chrome - Electron apps (Claude, Cursor, VS Code, Slack, etc.) share
+    # the same window class. Every window the fallback path touches, at
+    # BOTH enum time and action time, must be confirmed to actually belong
+    # to a chrome.exe process before it is ever shown as a row or closed -
+    # otherwise an X on what looks like a "Chrome" row could WM_CLOSE an
+    # unrelated application. Drop-on-failure: a window whose PID cannot be
+    # resolved to a live process is never treated as Chrome.
+    function Test-ChromeOwnedWindow {
+        param([IntPtr]$Hwnd)
+        try {
+            [uint32]$winPid = 0
+            [void][SweeperWin32]::GetWindowThreadProcessId($Hwnd, [ref]$winPid)
+            if ($winPid -eq 0) { return $false }
+            $proc = Get-Process -Id $winPid -ErrorAction Stop
+            return ($proc.ProcessName -eq 'chrome')
+        } catch {
+            return $false
+        }
+    }
+
     if (-not $cmd -or -not $cmd.Op) { return @{ Ok = $false; Message = 'Invalid command' } }
 
     try {
@@ -1046,6 +1166,108 @@ $script:WorkerScript = {
                 return @{ Ok = $true; Message = ''; Rows = $rows }
             }
 
+            # v0.4 Phase 3: two independent paths. CDP path is config-gated,
+            # never automatic - see the port-selection logic below for the
+            # exact test-isolation contract (Sol P1 + panel P2). Window
+            # fallback is the default when no CDP port is in play at all.
+            'EnumChrome' {
+                $rows = @()
+                # Sol MAJOR fix: EITHER Chrome test env var being active puts
+                # us into full exclusive test mode - settings-configured
+                # chromeDebugPorts are ignored ENTIRELY the moment either var
+                # is set, not just when TEST_PORT is. The original bug: a
+                # TEST_PID-only run (no TEST_PORT) fell into the "normal"
+                # else-branch below and still probed real configured ports,
+                # so a machine with :9223 configured could expose/close real
+                # automation tabs during what was meant to be a PID-fenced
+                # fallback-only test. CDP probing now happens ONLY when
+                # WINDOWSWEEPER_CHROME_DEBUG_PORT itself is set (and only
+                # that one port); TEST_PID-only mode probes no CDP port at
+                # all (window-fallback only, fenced to that PID - see below).
+                $testPortRaw = $env:WINDOWSWEEPER_CHROME_DEBUG_PORT
+                $testPidRaw = $env:WINDOWSWEEPER_CHROME_TEST_PID
+                $chromeTestModeActive = (-not [string]::IsNullOrEmpty($testPortRaw)) -or (-not [string]::IsNullOrEmpty($testPidRaw))
+
+                $ports = @()
+                if ($chromeTestModeActive) {
+                    if (-not [string]::IsNullOrEmpty($testPortRaw)) {
+                        $parsedPort = 0
+                        if ([int]::TryParse($testPortRaw, [ref]$parsedPort)) { $ports = @($parsedPort) }
+                    }
+                } else {
+                    $ports = @($cmd.ChromeDebugPorts | Where-Object { $_ })
+                }
+
+                foreach ($port in $ports) {
+                    $pages = Get-ChromeCdpPages -Port $port
+                    foreach ($tab in $pages) {
+                        try {
+                            $title = "$($tab.title)".Trim()
+                            if (-not $title) { $title = '(untitled tab)' }
+                            $url = "$($tab.url)".Trim()
+                            $detailUrl = $url
+                            if ($detailUrl.Length -gt 80) { $detailUrl = $detailUrl.Substring(0, 77) + '...' }
+                            $tabId = "$($tab.id)"
+                            if (-not $tabId) { continue }
+                            $rows += [PSCustomObject]@{
+                                App = 'Chrome'; RowType = 'Tab'; Name = $title; Detail = $detailUrl; Status = 'Tab'
+                                Key = @{ Kind = 'CdpTab'; Port = $port; Id = $tabId }
+                                Hwnd = 0; CanSave = $false; CanClose = $true
+                            }
+                        } catch { continue }
+                    }
+                }
+
+                # Window fallback: the default when no CDP ports are
+                # configured at all (real usage) - once any port is in play,
+                # the fallback is superseded for this call. In Chrome test
+                # mode, the fallback is disabled UNLESS TEST_PID is also set
+                # (Sol P1) - otherwise a CDP-only (TEST_PORT-only) test run
+                # could also enumerate Nick's real Chrome windows via the
+                # fallback path. TEST_PID-only mode (no TEST_PORT) lands here
+                # too: $ports is empty (no CDP probing at all per the fix
+                # above), so the fallback is what carries that test entirely.
+                $fallbackAllowed = $false
+                if (-not $chromeTestModeActive -and $ports.Count -eq 0) { $fallbackAllowed = $true }
+                if ($chromeTestModeActive -and -not [string]::IsNullOrEmpty($testPidRaw)) { $fallbackAllowed = $true }
+
+                if ($fallbackAllowed) {
+                    $winList = @([SweeperWin32]::GetTopLevelWindows() | Where-Object { $_.ClassName -eq 'Chrome_WidgetWin_1' -and $_.Visible -and $_.Title })
+                    # Sol hardening: keep a candidate only if its owning
+                    # process image is actually chrome.exe - Electron apps
+                    # (Claude, Cursor, etc.) share the same window class and
+                    # would otherwise appear as fake "Chrome" rows.
+                    $winList = @($winList | Where-Object { Test-ChromeOwnedWindow -Hwnd $_.Hwnd })
+                    if (-not [string]::IsNullOrEmpty($testPidRaw)) {
+                        # TEST_PID fences the fallback to only the fixture's
+                        # own windows (mirrors the Excel WINDOWSWEEPER_TEST_PID
+                        # pattern) - an unparsable value fences to nothing
+                        # rather than falling through to "everything."
+                        $parsedTestPid = 0
+                        if ([int]::TryParse($testPidRaw, [ref]$parsedTestPid)) {
+                            $winList = @($winList | Where-Object { $_.Pid -eq $parsedTestPid })
+                        } else {
+                            $winList = @()
+                        }
+                    }
+                    foreach ($w in $winList) {
+                        $rows += [PSCustomObject]@{
+                            App = 'Chrome'; RowType = 'BrowserWindow'; Name = $w.Title; Detail = 'browser window - tabs unknown'; Status = 'Window'
+                            Key = @{ Kind = 'ChromeWindow'; Hwnd = $w.Hwnd.ToInt64() }
+                            Hwnd = $w.Hwnd.ToInt64(); CanSave = $false; CanClose = $true
+                        }
+                    }
+                }
+
+                # v0.4 test hook - same name-regex contract as Word/Outlook,
+                # so fixture-fenced GUI tests can scope to only fixture rows.
+                $testFilter = $env:WINDOWSWEEPER_TEST_FILTER
+                if ($testFilter) {
+                    try { $rows = @($rows | Where-Object { $_.Name -match $testFilter }) } catch {}
+                }
+                return @{ Ok = $true; Message = ''; Rows = $rows }
+            }
+
             'ExcelSaveClose' {
                 $wb = Resolve-Workbook $cmd.Key
                 if (-not $wb) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
@@ -1276,6 +1498,106 @@ $script:WorkerScript = {
                 catch { return @{ Ok = $false; Message = $_.Exception.Message } }
             }
 
+            # v0.4 Phase 3: no confirm/live-recheck gate here the way
+            # Excel/Word/Outlook Close ops have one - Chrome has no save
+            # prompts at all, so there is no "changed since refresh" state
+            # to catch. Liveness is just "did the close succeed" (a 404 =
+            # already gone, reported gracefully, not an error).
+            'ChromeTabClose' {
+                $port = $cmd.Key.Port
+                $id = $cmd.Key.Id
+                if (-not $port -or -not $id) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                $r = Invoke-ChromeCdpGet -Url "http://127.0.0.1:$port/json/close/$id"
+                if ($r.Ok) { return @{ Ok = $true; Message = 'Closed' } }
+                if ($r.StatusCode -eq 404) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                return @{ Ok = $false; Message = 'Could not close tab' }
+            }
+
+            'ChromeTabActivate' {
+                $port = $cmd.Key.Port
+                $id = $cmd.Key.Id
+                if (-not $port -or -not $id) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                $r = Invoke-ChromeCdpGet -Url "http://127.0.0.1:$port/json/activate/$id"
+                if (-not $r.Ok) {
+                    if ($r.StatusCode -eq 404) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                    return @{ Ok = $false; Message = 'Could not activate tab' }
+                }
+                # Best-effort window fronting only (Sol P2): CDP supplies no
+                # HWND, so front ONLY when exactly one visible
+                # Chrome_WidgetWin_1 title matches this tab's title - same
+                # "Name - <app>" shape EnumExcel already matches on.
+                # Ambiguous or no match -> activate without fronting, never
+                # guess which window to bring forward. Sol MINOR: the
+                # candidate filter must also confirm chrome.exe ownership -
+                # class+title alone could let a uniquely-matching Electron
+                # window (same class, coincidentally identical title) get
+                # foregrounded instead.
+                try {
+                    $tabTitle = "$($cmd.TabTitle)"
+                    if ($tabTitle) {
+                        $titleMatches = @([SweeperWin32]::GetTopLevelWindows() | Where-Object {
+                            $_.ClassName -eq 'Chrome_WidgetWin_1' -and $_.Visible -and
+                            ($_.Title -eq $tabTitle -or $_.Title.StartsWith("$tabTitle - ")) -and
+                            (Test-ChromeOwnedWindow -Hwnd $_.Hwnd)
+                        })
+                        if ($titleMatches.Count -eq 1) {
+                            [SweeperWin32]::ShowWindow($titleMatches[0].Hwnd, [SweeperWin32]::SW_RESTORE) | Out-Null
+                            [SweeperWin32]::SetForegroundWindow($titleMatches[0].Hwnd) | Out-Null
+                        }
+                    }
+                } catch {}
+                return @{ Ok = $true; Message = 'Activated' }
+            }
+
+            # Pure Win32 - kept as a worker op only for routing uniformity
+            # with every other Close op (it cannot hang, so there is no
+            # watchdog benefit, but Invoke-BatchOp/Invoke-RowClose need a
+            # single consistent call shape).
+            'ChromeWindowClose' {
+                $hwndRaw = $cmd.Key.Hwnd
+                if (-not $hwndRaw) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                $h = [IntPtr]$hwndRaw
+                if (-not [SweeperWin32]::IsWindow($h)) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                # Sol hardening: re-confirm the owning process is actually
+                # chrome.exe at ACTION time, not just at enum time - a stale
+                # or reused hwnd (the window closed and the OS handed that
+                # numeric value to an unrelated Electron app) must never
+                # reach WM_CLOSE just because it once belonged to Chrome.
+                if (-not (Test-ChromeOwnedWindow -Hwnd $h)) {
+                    return @{ Ok = $false; Message = 'No longer open - refresh and try again' }
+                }
+                # v0.4 Phase 3 test isolation: when a fixture PID is pinned,
+                # refuse any hwnd whose LIVE pid differs - re-checked here at
+                # action time (not just at enum time), so a stale key can
+                # never reach a real Chrome window.
+                $testPidRaw = $env:WINDOWSWEEPER_CHROME_TEST_PID
+                if (-not [string]::IsNullOrEmpty($testPidRaw)) {
+                    $parsedTestPid = 0
+                    if ([int]::TryParse($testPidRaw, [ref]$parsedTestPid)) {
+                        [uint32]$actualPid = 0
+                        [void][SweeperWin32]::GetWindowThreadProcessId($h, [ref]$actualPid)
+                        if ($actualPid -ne $parsedTestPid) {
+                            return @{ Ok = $false; Message = 'Refused - window PID does not match the test fixture' }
+                        }
+                    }
+                }
+                try {
+                    # Chrome may show its own "close all tabs?" prompt - not
+                    # suppressed, per plan.
+                    # Sol MAJOR: PostMessage's bool return was previously
+                    # discarded and Ok=$true reported unconditionally - an
+                    # access-denied or close-race would report success and
+                    # inflate a batch "Closed" tally. Check the return value
+                    # and surface the real Win32 error on failure.
+                    $posted = [SweeperWin32]::PostMessage($h, [SweeperWin32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                    if (-not $posted) {
+                        $errCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        return @{ Ok = $false; Message = "Could not close window (Win32 error $errCode)" }
+                    }
+                    return @{ Ok = $true; Message = 'Close requested' }
+                } catch { return @{ Ok = $false; Message = $_.Exception.Message } }
+            }
+
             default { return @{ Ok = $false; Message = "Unknown op: $($cmd.Op)" } }
         }
     } catch {
@@ -1427,6 +1749,36 @@ function Get-Snapshot {
                 } else {
                     $script:OutlookBackoffUntil = [datetime]::MinValue
                 }
+            }
+        }
+    }
+
+    # Same bail-out shape again, for the Outlook -> Chrome boundary.
+    if ($script:ClosingRequested) {
+        Write-DebugLog "Get-Snapshot ABORT-before-chrome (closing)"
+        return @{ Rows = $rows; BusyApps = @($busyApps | Select-Object -Unique); Messages = $messages }
+    }
+
+    if ($Apps -contains 'Chrome') {
+        # v0.4 Phase 3: no Test-AppResponsive/busy-row gating here - the CDP
+        # path is a stateless HTTP call (its own 2s-per-port timeout is the
+        # ceiling) and the window fallback is pure Win32 enumeration;
+        # neither has an equivalent to Excel/Outlook's "COM call parked
+        # behind a modal dialog" busy state. A dead/unconfigured port just
+        # yields zero CDP rows - the window fallback (if not excluded by
+        # test isolation) still shows. chrome.exe not running -> nothing to
+        # enumerate, no Info row needed (Chrome, unlike Outlook, has no
+        # "wrong app is running" ambiguity to explain).
+        if (Get-Process -Name 'chrome' -ErrorAction SilentlyContinue) {
+            $chromePorts = @()
+            try { $chromePorts = @((Get-Settings).chromeDebugPorts) } catch {}
+            $r = Invoke-ComTask -Command @{ Op = 'EnumChrome'; ChromeDebugPorts = $chromePorts } -TimeoutMs 10000 -OwnerForm $OwnerForm -StatusText 'Scanning Chrome...'
+            if ($r.TimedOut) {
+                $messages += 'Chrome: timed out'
+            } elseif (-not $r.Ok) {
+                $messages += "Chrome: $($r.Message)"
+            } else {
+                $rows += $r.Rows
             }
         }
     }
@@ -1858,7 +2210,7 @@ function Do-RefreshForApps {
 }
 
 function Show-DiscardConfirm {
-    param([string[]]$Names)
+    param($Rows)
     if ($script:SkipDiscardConfirmThisSession) { return $true }
     $settings = Get-Settings
     if (-not $settings.confirmDiscard) { return $true }
@@ -1872,8 +2224,28 @@ function Show-DiscardConfirm {
     $dlg.Width = 440
     $dlg.Height = 260
 
+    # v0.4 Phase 3: Chrome tabs have no save state, so lumping them under
+    # "This will discard unsaved changes in:" would be misleading -
+    # Close All and Discard can sweep a mix of genuinely-unsaved documents,
+    # already-Saved rows, and Chrome tabs. Split into two labeled sections;
+    # either can be empty (a single non-Chrome row still reads naturally).
+    $chromeRows = @($Rows | Where-Object { $_.App -eq 'Chrome' })
+    $otherRows = @($Rows | Where-Object { $_.App -ne 'Chrome' })
+    $lines = @()
+    if ($otherRows.Count -gt 0) {
+        $lines += 'This will discard unsaved changes in:'
+        $lines += ''
+        $lines += @($otherRows | ForEach-Object { " - $($_.Name)" })
+    }
+    if ($chromeRows.Count -gt 0) {
+        if ($lines.Count -gt 0) { $lines += '' }
+        $lines += 'Browser tabs (nothing to save):'
+        $lines += @($chromeRows | ForEach-Object { " - $($_.Name)" })
+    }
+    if ($lines.Count -eq 0) { $lines = @('This will close the selected item(s).') }
+
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = "This will discard unsaved changes in:`r`n`r`n" + (($Names | ForEach-Object { " - $_" }) -join "`r`n")
+    $lbl.Text = ($lines -join "`r`n")
     $lbl.Location = New-Object System.Drawing.Point(15, 15)
     $lbl.Size = New-Object System.Drawing.Size(400, 140)
 
@@ -1937,6 +2309,25 @@ function Request-DeferredRefresh {
 # deciding what to do with it). The Hwnd was already captured at enum time
 # for exactly this; a click now just fronts it directly. ExcelActivate/
 # OutlookActivate worker ops still exist but nothing calls them from here.
+# v0.4 Phase 3 hardening (Sol): top-level twin of the worker's own
+# Test-ChromeOwnedWindow (that one is scoped inside $script:WorkerScript's
+# closure and unreachable from here) - Invoke-RowActivate's Win32Front path
+# runs entirely on the UI thread with no worker round-trip, so it needs its
+# own copy of the same owning-process check. Chrome_WidgetWin_1 is shared
+# by Electron apps (Claude, Cursor, etc.); drop-on-failure.
+function Test-ChromeOwnedWindow {
+    param([IntPtr]$Hwnd)
+    try {
+        [uint32]$winPid = 0
+        [void][SweeperWin32]::GetWindowThreadProcessId($Hwnd, [ref]$winPid)
+        if ($winPid -eq 0) { return $false }
+        $proc = Get-Process -Id $winPid -ErrorAction Stop
+        return ($proc.ProcessName -eq 'chrome')
+    } catch {
+        return $false
+    }
+}
+
 # v0.4 Phase 0: which (App, RowType) combos are even clickable, and how, now
 # comes from the routing table rather than a hardcoded RowType whitelist -
 # an unrecognized combo (or a future CdpActivate style not implemented yet)
@@ -1950,14 +2341,53 @@ function Invoke-RowActivate {
         Write-DebugLog "Invoke-RowActivate NO-ROUTE App=$($Row.App) RowType=$($Row.RowType)"
         return
     }
-    if ($route.ActivateStyle -ne 'Win32Front') {
-        Write-DebugLog "Invoke-RowActivate UNHANDLED-STYLE App=$($Row.App) RowType=$($Row.RowType) Style=$($route.ActivateStyle)"
+    if ($route.ActivateStyle -eq 'Win32Front') {
+        if (-not $Row.Hwnd -or $Row.Hwnd -eq 0) { return }  # no unique window captured - silent no-op
+        $h = [IntPtr]$Row.Hwnd
+        # Scoped strictly to Chrome BrowserWindow rows so none of this ever
+        # touches Excel/Word/Outlook fronting.
+        if ($Row.App -eq 'Chrome' -and $Row.RowType -eq 'BrowserWindow') {
+            # Sol hardening: re-confirm the owning process is actually
+            # chrome.exe at ACTION time, unconditionally (not just under
+            # test isolation) - a stale/reused hwnd (the window closed and
+            # the OS handed that numeric value to an unrelated Electron
+            # app) must never be fronted just because it once belonged to
+            # Chrome.
+            if (-not (Test-ChromeOwnedWindow -Hwnd $h)) {
+                Write-DebugLog "Invoke-RowActivate REFUSED Chrome BrowserWindow hwnd is not chrome.exe-owned"
+                return
+            }
+            # v0.4 Phase 3 test isolation: while WINDOWSWEEPER_CHROME_TEST_PID
+            # is pinned, ALSO refuse any hwnd whose live PID does not match
+            # the fixture - re-checked here, not just at enum time,
+            # mirroring ChromeWindowClose's own re-check.
+            $testPidRaw = $env:WINDOWSWEEPER_CHROME_TEST_PID
+            if (-not [string]::IsNullOrEmpty($testPidRaw)) {
+                $parsedTestPid = 0
+                if ([int]::TryParse($testPidRaw, [ref]$parsedTestPid)) {
+                    [uint32]$actualPid = 0
+                    [void][SweeperWin32]::GetWindowThreadProcessId($h, [ref]$actualPid)
+                    if ($actualPid -ne $parsedTestPid) {
+                        Write-DebugLog "Invoke-RowActivate REFUSED Chrome BrowserWindow hwnd PID mismatch"
+                        return
+                    }
+                }
+            }
+        }
+        [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null
+        [SweeperWin32]::SetForegroundWindow($h) | Out-Null
         return
     }
-    if (-not $Row.Hwnd -or $Row.Hwnd -eq 0) { return }  # no unique window captured - silent no-op
-    $h = [IntPtr]$Row.Hwnd
-    [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null
-    [SweeperWin32]::SetForegroundWindow($h) | Out-Null
+    if ($route.ActivateStyle -eq 'CdpActivate') {
+        # v0.4 Phase 3: CDP tabs have no HWND of their own - activation is
+        # an HTTP call (/json/activate/<id>), routed through Invoke-ComTask
+        # for the same uniformity as every other action even though it is
+        # not COM and cannot hang the UI thread the way a COM call can (the
+        # no-COM-on-click guarantee is preserved in spirit, not in letter).
+        Invoke-ComTask -Command @{ Op = 'ChromeTabActivate'; Key = $Row.Key; TabTitle = $Row.Name } -TimeoutMs 5000 -OwnerForm $script:MainForm -StatusText "Activating $($Row.Name)..." | Out-Null
+        return
+    }
+    Write-DebugLog "Invoke-RowActivate UNHANDLED-STYLE App=$($Row.App) RowType=$($Row.RowType) Style=$($route.ActivateStyle)"
 }
 
 # v0.4 Phase 0: op names now come from the routing table instead of an
@@ -2024,13 +2454,13 @@ function Invoke-RowClose {
 
     $confirmedDiscard = $false
     if ($Row.Status -eq 'UNSAVED' -or $Row.Status -eq 'Never saved') {
-        if (-not (Show-DiscardConfirm -Names @($Row.Name))) { return }
+        if (-not (Show-DiscardConfirm -Rows @($Row))) { return }
         $confirmedDiscard = $true
     }
 
     $result = Invoke-ComTask -Command @{ Op = $op; Key = $Row.Key; ConfirmedDiscard = $confirmedDiscard } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "Closing $($Row.Name)..."
     if ($result.NeedsConfirm) {
-        if (-not (Show-DiscardConfirm -Names @($Row.Name))) { return }
+        if (-not (Show-DiscardConfirm -Rows @($Row))) { return }
         $result = Invoke-ComTask -Command @{ Op = $op; Key = $Row.Key; ConfirmedDiscard = $true } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "Closing $($Row.Name)..."
     }
     Write-ActionLog -App $Row.App -Name $Row.Name -Action 'Close' -Result $result -Path $Row.Detail
@@ -2128,7 +2558,7 @@ function Invoke-CloseAllDiscard {
         [System.Windows.Forms.MessageBox]::Show($script:MainForm, 'Nothing to close.', 'Close All and Discard', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
         return
     }
-    if (-not (Show-DiscardConfirm -Names @($rows | ForEach-Object { $_.Name }))) { return }
+    if (-not (Show-DiscardConfirm -Rows $rows)) { return }
     # Names were already listed and confirmed above, so every row in this
     # batch is sent pre-confirmed.
     $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'Close' -OpKind 'CloseOp' -ConfirmedDiscard $true
@@ -2146,7 +2576,12 @@ function New-MainForm {
     # runspace since environment variables are process-wide).
     $testFilterPattern = $env:WINDOWSWEEPER_TEST_FILTER
     $testPidEnv = $env:WINDOWSWEEPER_TEST_PID
-    $testActive = (-not [string]::IsNullOrEmpty($testFilterPattern)) -or (-not [string]::IsNullOrEmpty($testPidEnv))
+    # v0.4 Phase 3: the Chrome fixture env vars are their own test-isolation
+    # signal (see EnumChrome) - either one active also lights up the
+    # existing TEST banner, same as the Excel/Outlook test vars.
+    $testChromePortEnv = $env:WINDOWSWEEPER_CHROME_DEBUG_PORT
+    $testChromePidEnv = $env:WINDOWSWEEPER_CHROME_TEST_PID
+    $testActive = (-not [string]::IsNullOrEmpty($testFilterPattern)) -or (-not [string]::IsNullOrEmpty($testPidEnv)) -or (-not [string]::IsNullOrEmpty($testChromePortEnv)) -or (-not [string]::IsNullOrEmpty($testChromePidEnv))
 
     $form = New-Object System.Windows.Forms.Form
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.75)
@@ -2232,6 +2667,8 @@ function New-MainForm {
         $testParts = @()
         if (-not [string]::IsNullOrEmpty($testFilterPattern)) { $testParts += "pattern='$testFilterPattern'" }
         if (-not [string]::IsNullOrEmpty($testPidEnv)) { $testParts += "pid=$testPidEnv" }
+        if (-not [string]::IsNullOrEmpty($testChromePortEnv)) { $testParts += "chrome port=$testChromePortEnv" }
+        if (-not [string]::IsNullOrEmpty($testChromePidEnv)) { $testParts += "chrome pid=$testChromePidEnv" }
         $testBanner = New-Object System.Windows.Forms.Panel
         $testBanner.Dock = 'Top'; $testBanner.Height = 24
         $testBanner.BackColor = [System.Drawing.Color]::FromArgb(255, 210, 210)

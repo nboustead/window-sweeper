@@ -10,7 +10,8 @@ them one at a time and answering "Do you want to save changes?" for each.
 How to use it:
 1. Double-click Run-WindowSweeper.bat. Actions are quick, usually 1-3
    seconds each.
-2. Pick Both, Excel, or Outlook at the top; click Refresh any time.
+2. Tick or untick the Excel / Word / Outlook / Chrome boxes at the top
+   to choose which apps are listed; click Refresh any time.
 3. Click "Save & Close" or "X" on a row to act on just that window, or
    use Save & Close All / Close All Saved / Close All and Discard at
    the bottom for many at once. Close All and Discard always lists what
@@ -24,9 +25,27 @@ How to use it:
 Rows in red have unsaved changes; closing one with X always confirms
 first, listing exactly what will be discarded.
 
+CHROME TABS (optional, off by default)
+======================================
+Out of the box, Chrome shows up as whole browser WINDOWS only (closing
+one may show Chrome's own "close all tabs?" prompt - that is Chrome
+asking, not this tool). To list and close INDIVIDUAL tabs, Chrome must
+be started with remote debugging on, and this tool must be told the
+port:
+1. Start Chrome like this (Chrome 136 and newer needs BOTH switches;
+   use any folder you like for the second one):
+     chrome.exe --remote-debugging-port=9333 --user-data-dir=C:\ChromeDebugProfile
+2. Open %USERPROFILE%\.window-sweeper\settings.json in Notepad and add:
+     "chromeDebugPorts": [9333]
+3. Restart Window Sweeper. Tabs from that Chrome now appear as rows.
+WARNING: only point this at a Chrome you are happy to close tabs in.
+If a Chrome debug port belongs to an automation setup (for example a
+browser other tools drive), adding it here lets the sweeper close that
+automation's tabs.
+
 Having trouble and want Claude to look into it? Close the tool, set
 WINDOWSWEEPER_DEBUG=1, and reopen it - a detailed log gets written to
-C:\Users\taver\.window-sweeper\logs\debug.log.
+%USERPROFILE%\.window-sweeper\logs\debug.log.
 
 MAKE A DESKTOP SHORTCUT
 ========================
@@ -56,6 +75,6 @@ MANUAL VERIFICATION CHECKLIST (run after any change to the tool)
 - "Close All and Discard" lists every affected file/email name before
   asking you to confirm.
 - Every action (save, close, discard) adds one row to
-  C:\Users\taver\.window-sweeper\logs\actions-YYYY-MM-DD.csv
+  %USERPROFILE%\.window-sweeper\logs\actions-YYYY-MM-DD.csv
 - Closing excel.exe from outside the tool (Task Manager), then clicking
   Refresh, updates the list cleanly with no error.
