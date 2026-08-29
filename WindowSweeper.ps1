@@ -1790,7 +1790,7 @@ function Invoke-DiagMode {
     Initialize-StateDir
     $snap = Get-Snapshot -Apps $script:KnownApps -OwnerForm $null
     Write-Host ''
-    Write-Host 'Window Sweeper v0.4.0-dev - Diagnostic Enumeration' -ForegroundColor Cyan
+    Write-Host 'Window Sweeper v0.4.0 - Diagnostic Enumeration' -ForegroundColor Cyan
     Write-Host ('-' * 74)
     $fmt = '{0,-8} {1,-30} {2,-24} {3,-10}'
     Write-Host ($fmt -f 'App', 'Name', 'Detail', 'Status')
@@ -2585,7 +2585,7 @@ function New-MainForm {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.75)
-    $form.Text = 'Window Sweeper v0.4.0-dev'
+    $form.Text = 'Window Sweeper v0.4.0'
     if ($testActive) { $form.Text = $form.Text + ' [TEST]' }
     $form.Width = 920
     $form.Height = 600
