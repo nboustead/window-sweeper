@@ -35,7 +35,7 @@ for ($i = 0; $i -lt $script:KnownApps.Count; $i++) { $script:AppOrder[$script:Kn
 # Busy/Info/Explorer placeholder) - what Get-CountsSummary tallies per app.
 # Word adds Document/ProtectedView in Phase 2; Chrome adds Tab/BrowserWindow
 # in Phase 3.
-$script:CountableRowTypes = @('Workbook', 'Inspector')
+$script:CountableRowTypes = @('Workbook', 'Inspector', 'Document', 'ProtectedView')
 
 # v0.4 Phase 0: generic action routing, keyed "App|RowType" -> the op names
 # and activation style for that combination. Invoke-RowSaveClose/
@@ -48,9 +48,11 @@ $script:CountableRowTypes = @('Workbook', 'Inspector')
 # (all COM apps, and Chrome windows once Phase 3 lands). 'CdpActivate' is
 # reserved for Phase 3 Chrome CDP tabs, which have no HWND of their own.
 $script:ActionRouting = @{
-    'Excel|Workbook'    = @{ SaveCloseOp = 'ExcelSaveClose'; CloseOp = 'ExcelClose'; SaveAsOp = 'ExcelSaveAs'; ActivateStyle = 'Win32Front' }
-    'Outlook|Inspector' = @{ SaveCloseOp = 'OutlookSaveClose'; CloseOp = 'OutlookClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
-    'Outlook|Explorer'  = @{ SaveCloseOp = $null; CloseOp = 'ExplorerClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+    'Excel|Workbook'      = @{ SaveCloseOp = 'ExcelSaveClose'; CloseOp = 'ExcelClose'; SaveAsOp = 'ExcelSaveAs'; ActivateStyle = 'Win32Front' }
+    'Word|Document'       = @{ SaveCloseOp = 'WordSaveClose'; CloseOp = 'WordClose'; SaveAsOp = 'WordSaveAs'; ActivateStyle = 'Win32Front' }
+    'Word|ProtectedView'  = @{ SaveCloseOp = $null; CloseOp = 'WordProtectedViewClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+    'Outlook|Inspector'   = @{ SaveCloseOp = 'OutlookSaveClose'; CloseOp = 'OutlookClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+    'Outlook|Explorer'    = @{ SaveCloseOp = $null; CloseOp = 'ExplorerClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
 }
 
 function Get-RoutingEntry {
@@ -653,6 +655,73 @@ $script:WorkerScript = {
         } catch { return $null }
     }
 
+    # v0.4 Phase 2: Word COM attach - GetActiveObject ONLY, same discipline as
+    # Attach-Outlook, and for the same reason: this must never launch a new
+    # Word process as a side effect of what looks like a read-only
+    # enumeration/refresh. Cached like Outlook, validated with one cheap
+    # property read before reuse. Documented limitation (Sol): only the
+    # ROT-registered instance is ever reachable - multi-instance Word is rare
+    # and there is no OBJID_NATIVEOM trick for it the way Attach-ExcelInstances
+    # has for Excel.
+    function Attach-Word {
+        if ($script:CachedWord) {
+            try { $null = $script:CachedWord.Version; return $script:CachedWord }
+            catch { $script:CachedWord = $null }
+        }
+        try {
+            $wd = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Word.Application')
+            $script:CachedWord = $wd
+            return $wd
+        } catch { return $null }
+    }
+
+    # Key = @{ Kind='WordName'; Name; FullName }. A key carrying a non-empty
+    # FullName (Sol P1 - stale-key wrong-target) MUST match FullName exactly
+    # - Name alone is never sufficient once a path exists, because the
+    # original document could have closed and a DIFFERENT file that happens
+    # to share the same filename (in another folder) could now be open,
+    # silently becoming the target of the action. Name-alone matching is
+    # only acceptable for a pathless key (a never-saved document at
+    # snapshot time, where FullName was empty), and even then more than one
+    # live document sharing that placeholder name is ambiguous - refuse
+    # rather than guess, same contract as Resolve-Inspector's Ambiguous flag.
+    function Resolve-WordDocument {
+        param($word, $key)
+        if ($key.Kind -ne 'WordName') { return @{ Doc = $null; Ambiguous = $false } }
+        $nameMatches = @()
+        foreach ($doc in @($word.Documents)) {
+            try { if ($doc.Name -eq $key.Name) { $nameMatches += $doc } } catch {}
+        }
+        if ($key.FullName) {
+            $pathMatches = @($nameMatches | Where-Object {
+                $fn = $null
+                try { $fn = $_.FullName } catch {}
+                $fn -eq $key.FullName
+            })
+            if ($pathMatches.Count -eq 1) { return @{ Doc = $pathMatches[0]; Ambiguous = $false } }
+            if ($pathMatches.Count -gt 1) { return @{ Doc = $null; Ambiguous = $true } }
+            return @{ Doc = $null; Ambiguous = $false }
+        }
+        if ($nameMatches.Count -eq 1) { return @{ Doc = $nameMatches[0]; Ambiguous = $false } }
+        if ($nameMatches.Count -gt 1) { return @{ Doc = $null; Ambiguous = $true } }
+        return @{ Doc = $null; Ambiguous = $false }
+    }
+
+    # Same Index+VerifyCaption liveness contract as Resolve-Explorer.
+    function Resolve-ProtectedView {
+        param($word, $key)
+        if ($key.Kind -ne 'Index') { return $null }
+        $pvws = @($word.ProtectedViewWindows)
+        if ($key.Index -ge $pvws.Count) { return $null }
+        $pvw = $pvws[$key.Index]
+        if ($key.VerifyCaption) {
+            $cap = $null
+            try { $cap = $pvw.Caption } catch {}
+            if ($cap -ne $key.VerifyCaption) { return $null }
+        }
+        return $pvw
+    }
+
     # EntryID when the item has one (anything already saved to a store);
     # otherwise a composite Subject+MessageClass+Index - Resolve-Inspector
     # uses the Index only to break a tie when Subject+MessageClass alone
@@ -768,7 +837,11 @@ $script:WorkerScript = {
                             if (-not $matchWin) { continue }  # hidden window (PERSONAL.XLSB, add-ins) - never listed
                             $hasPath = $false
                             try { $hasPath = [bool]$wb.Path } catch {}
-                            $saved = $true
+                            # Fail CLOSED (Sol cross-app hardening): default
+                            # to unsaved, not saved, so an unreadable .Saved
+                            # never mislabels a row 'Saved' when the true
+                            # state is unknown.
+                            $saved = $false
                             try { $saved = [bool]$wb.Saved } catch {}
                             $status = 'Saved'
                             if (-not $hasPath) { $status = 'Never saved' }
@@ -800,6 +873,84 @@ $script:WorkerScript = {
                 $testFilter = $env:WINDOWSWEEPER_TEST_FILTER
                 if ($testFilter) {
                     try { $rows = @($rows | Where-Object { $_.RowType -ne 'Workbook' -or $_.Name -match $testFilter }) } catch {}
+                }
+                return @{ Ok = $true; Message = ''; Rows = $rows }
+            }
+
+            # v0.4 Phase 2: Documents rows + ProtectedViewWindows rows.
+            # Get-Snapshot pre-gates on WINWORD actually running before ever
+            # calling this, so a $null Attach-Word here means either a rare
+            # attach race or a non-ROT instance - report it rather than
+            # crash, but never try to launch one.
+            'EnumWord' {
+                $word = Attach-Word
+                if (-not $word) {
+                    # Sol minor: surface an Info row (same contract as
+                    # Outlook's "not running" row) rather than silently
+                    # returning zero rows - a running-but-unreachable Word
+                    # must never just vanish from the grid.
+                    $msg = 'Word is running but not reachable - try again'
+                    return @{ Ok = $true; Message = $msg; Rows = @([PSCustomObject]@{ App = 'Word'; RowType = 'Info'; Name = 'Word'; Detail = $msg; Status = 'Info'; Key = $null; Hwnd = 0; CanSave = $false; CanClose = $false }) }
+                }
+                $rows = @()
+                $docs = @()
+                try { $docs = @($word.Documents) } catch {
+                    $rows += [PSCustomObject]@{ App = 'Word'; RowType = 'Busy'; Name = 'Word'; Detail = 'Busy - could not read document list'; Status = 'Busy'; Key = $null; Hwnd = 0; CanSave = $false; CanClose = $false }
+                    return @{ Ok = $true; Message = ''; Rows = $rows }
+                }
+                foreach ($doc in $docs) {
+                    try {
+                        $name = $doc.Name
+                        $fullName = $null
+                        try { $fullName = $doc.FullName } catch {}
+                        $hasPath = $false
+                        try { $hasPath = [bool]$doc.Path } catch {}
+                        # Fail CLOSED (Sol P1/cross-app hardening): default
+                        # to unsaved so an unreadable .Saved labels the row
+                        # 'UNSAVED', never 'Saved'.
+                        $saved = $false
+                        try { $saved = [bool]$doc.Saved } catch {}
+                        $status = 'Saved'
+                        if (-not $hasPath) { $status = 'Never saved' }
+                        elseif (-not $saved) { $status = 'UNSAVED' }
+                        $detail = '(never saved)'
+                        if ($hasPath) { try { $detail = $doc.Path } catch {} }
+                        # Hwnd from the OBJECT MODEL, not title matching (Sol
+                        # P2): Word titles include the extension, unlike
+                        # Excel, so no shared title-matching helper is needed
+                        # or wanted here - Window.Hwnd kills the problem
+                        # entirely.
+                        $hwndVal = 0
+                        try { $hwndVal = [int64]$doc.Windows.Item(1).Hwnd } catch {}
+                        $rows += [PSCustomObject]@{
+                            App = 'Word'; RowType = 'Document'; Name = $name; Detail = $detail; Status = $status
+                            Key = @{ Kind = 'WordName'; Name = $name; FullName = $fullName }
+                            Hwnd = $hwndVal; CanSave = $true; CanClose = $true
+                        }
+                    } catch { continue }
+                }
+                $pvws = @()
+                try { $pvws = @($word.ProtectedViewWindows) } catch {}
+                for ($i = 0; $i -lt $pvws.Count; $i++) {
+                    try {
+                        $pvw = $pvws[$i]
+                        $caption = ''
+                        try { $caption = $pvw.Caption } catch {}
+                        $srcName = $caption
+                        try { if ($pvw.SourceName) { $srcName = $pvw.SourceName } } catch {}
+                        if (-not $srcName) { $srcName = 'Protected View document' }
+                        $rows += [PSCustomObject]@{
+                            App = 'Word'; RowType = 'ProtectedView'; Name = $srcName; Detail = 'read-only preview'; Status = 'Protected View'
+                            Key = @{ Kind = 'Index'; Index = $i; VerifyCaption = $caption }; Hwnd = 0; CanSave = $false; CanClose = $true
+                        }
+                    } catch { continue }
+                }
+                # v0.4 test hook - same name-regex contract as Outlook's
+                # Inspector filtering, so fixture-fenced GUI tests can scope
+                # to only their own Word documents.
+                $testFilter = $env:WINDOWSWEEPER_TEST_FILTER
+                if ($testFilter) {
+                    try { $rows = @($rows | Where-Object { $_.Name -match $testFilter }) } catch {}
                 }
                 return @{ Ok = $true; Message = ''; Rows = $rows }
             }
@@ -839,7 +990,11 @@ $script:WorkerScript = {
                         $mc = ''
                         try { $mc = $item.MessageClass } catch {}
                         $isReport = $mc -like 'REPORT.*'
-                        $saved = $true
+                        # Fail CLOSED (Sol cross-app hardening): default to
+                        # unsaved so an unreadable/missing .Saved never
+                        # mislabels a row 'Saved' when the true state is
+                        # unknown.
+                        $saved = $false
                         try { if ($item.PSObject.Properties.Match('Saved').Count -gt 0) { $saved = [bool]$item.Saved } } catch {}
                         $status = 'Saved'
                         if (-not $saved) { $status = 'UNSAVED' }
@@ -928,7 +1083,11 @@ $script:WorkerScript = {
                 # the last Refresh without clicking Refresh again.
                 $hasPath = $false
                 try { $hasPath = [bool]$wb.Path } catch {}
-                $saved = $true
+                # Fail CLOSED (Sol cross-app hardening): an unreadable .Saved
+                # must force the discard-confirm gate, not skip it - the old
+                # default-true let an unconfirmed Close($false) through on
+                # read failure.
+                $saved = $false
                 try { $saved = [bool]$wb.Saved } catch {}
                 $liveUnsaved = (-not $hasPath) -or (-not $saved)
                 if ($liveUnsaved -and -not $cmd.ConfirmedDiscard) {
@@ -943,6 +1102,111 @@ $script:WorkerScript = {
                 if (-not $wb) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
                 try { $wb.Activate(); $wb.Application.Visible = $true } catch {}
                 return @{ Ok = $true; Message = '' }
+            }
+
+            'WordSaveClose' {
+                $word = Attach-Word
+                if (-not $word) { return @{ Ok = $false; Message = 'Word not reachable' } }
+                $resolved = Resolve-WordDocument $word $cmd.Key
+                if (-not $resolved.Doc) {
+                    if ($resolved.Ambiguous) { return @{ Ok = $false; Message = 'Multiple documents look alike - refresh and try again' } }
+                    return @{ Ok = $false; Message = 'No longer open - refresh and try again' }
+                }
+                $doc = $resolved.Doc
+                $hasPath = $false
+                try { $hasPath = [bool]$doc.Path } catch {}
+                # Guard FIRST (Sol P1): doc.Save() on a pathless document
+                # BLOCKS inside this 10s op showing Word's own Save As dialog
+                # - exactly the ExcelSaveClose pathless guard, ported.
+                if (-not $hasPath) { return @{ Ok = $false; NeedsSaveAs = $true; Message = 'Never saved - use Save As' } }
+                try {
+                    $doc.Save()
+                    # Sol P1 (close-after-failed-save): a DocumentBeforeSave
+                    # add-in handler can CANCEL Save() without throwing -
+                    # re-verify the save actually landed before closing, or
+                    # Close(0) would silently discard the edits.
+                    $postPath = $false
+                    try { $postPath = [bool]$doc.Path } catch {}
+                    $postSaved = $false
+                    try { $postSaved = [bool]$doc.Saved } catch {}
+                    if (-not $postPath -or -not $postSaved) {
+                        return @{ Ok = $false; Message = 'Save did not complete - document kept open' }
+                    }
+                    $doc.Close(0)
+                    return @{ Ok = $true; Message = 'Saved and closed' }
+                } catch { return @{ Ok = $false; Message = $_.Exception.Message } }
+            }
+
+            # Never-saved-document flow only: blocks on purpose for up to
+            # 180s (per Invoke-ComTask's TimeoutMs for this op) while Nick
+            # uses the native Save As dialog.
+            'WordSaveAs' {
+                $word = Attach-Word
+                if (-not $word) { return @{ Ok = $false; Message = 'Word not reachable' } }
+                $resolved = Resolve-WordDocument $word $cmd.Key
+                if (-not $resolved.Doc) {
+                    if ($resolved.Ambiguous) { return @{ Ok = $false; Message = 'Multiple documents look alike - refresh and try again' } }
+                    return @{ Ok = $false; Message = 'No longer open - refresh and try again' }
+                }
+                $doc = $resolved.Doc
+                try {
+                    $doc.Activate()
+                    $shown = $word.Dialogs.Item(84).Show()  # wdDialogFileSaveAs
+                    if (-not $shown) { return @{ Ok = $true; Cancelled = $true; Message = 'Save As cancelled' } }
+                    # Sol P1: only -1 (OK/committed) means the dialog
+                    # actually drove a save. Show() can return other nonzero
+                    # values too (e.g. -2 when the user chose Close from the
+                    # dialog) - those are NOT a committed save and must not
+                    # fall through to Close(0), which would discard the edits.
+                    if ($shown -ne -1) {
+                        return @{ Ok = $false; Message = 'Save did not complete - document kept open' }
+                    }
+                    # Re-verify the save actually landed before closing - a
+                    # DocumentBeforeSave add-in handler can cancel the
+                    # dialog's internal save without throwing.
+                    $postPath = $false
+                    try { $postPath = [bool]$doc.Path } catch {}
+                    $postSaved = $false
+                    try { $postSaved = [bool]$doc.Saved } catch {}
+                    if (-not $postPath -or -not $postSaved) {
+                        return @{ Ok = $false; Message = 'Save did not complete - document kept open' }
+                    }
+                    $doc.Close(0)
+                    return @{ Ok = $true; Message = 'Saved and closed' }
+                } catch { return @{ Ok = $false; Message = $_.Exception.Message } }
+            }
+
+            'WordClose' {
+                $word = Attach-Word
+                if (-not $word) { return @{ Ok = $false; Message = 'Word not reachable' } }
+                $resolved = Resolve-WordDocument $word $cmd.Key
+                if (-not $resolved.Doc) {
+                    if ($resolved.Ambiguous) { return @{ Ok = $false; Message = 'Multiple documents look alike - refresh and try again' } }
+                    return @{ Ok = $false; Message = 'No longer open - refresh and try again' }
+                }
+                $doc = $resolved.Doc
+                # Re-read live save-state right before discarding - same
+                # staleness protection as ExcelClose.
+                $hasPath = $false
+                try { $hasPath = [bool]$doc.Path } catch {}
+                # Fail CLOSED (Sol cross-app hardening) - see ExcelClose.
+                $saved = $false
+                try { $saved = [bool]$doc.Saved } catch {}
+                $liveUnsaved = (-not $hasPath) -or (-not $saved)
+                if ($liveUnsaved -and -not $cmd.ConfirmedDiscard) {
+                    return @{ Ok = $false; NeedsConfirm = $true; Message = 'Has unsaved changes' }
+                }
+                try { $doc.Close(0); return @{ Ok = $true; Message = 'Closed without saving' } }  # wdDoNotSaveChanges, promptless
+                catch { return @{ Ok = $false; Message = $_.Exception.Message } }
+            }
+
+            'WordProtectedViewClose' {
+                $word = Attach-Word
+                if (-not $word) { return @{ Ok = $false; Message = 'Word not reachable' } }
+                $pvw = Resolve-ProtectedView $word $cmd.Key
+                if (-not $pvw) { return @{ Ok = $false; Message = 'No longer open - refresh and try again' } }
+                try { $pvw.Close(); return @{ Ok = $true; Message = 'Closed' } }
+                catch { return @{ Ok = $false; Message = $_.Exception.Message } }
             }
 
             'OutlookSaveClose' {
@@ -977,7 +1241,8 @@ $script:WorkerScript = {
                 $item = $resolved.Item
                 # Re-read live save-state right before discarding - same
                 # staleness protection as ExcelClose.
-                $saved = $true
+                # Fail CLOSED (Sol cross-app hardening) - see ExcelClose.
+                $saved = $false
                 try { if ($item.PSObject.Properties.Match('Saved').Count -gt 0) { $saved = [bool]$item.Saved } } catch {}
                 if (-not $saved -and -not $cmd.ConfirmedDiscard) {
                     return @{ Ok = $false; NeedsConfirm = $true; Message = 'Has unsaved changes' }
@@ -1080,8 +1345,37 @@ function Get-Snapshot {
     }
 
     # A close request that arrived during Excel enumeration should not go on
-    # to start a fresh Outlook wait too - bail before ever calling
+    # to start a fresh Word wait too - bail before ever calling
     # Invoke-ComTask again.
+    if ($script:ClosingRequested) {
+        Write-DebugLog "Get-Snapshot ABORT-before-word (closing)"
+        return @{ Rows = $rows; BusyApps = @($busyApps | Select-Object -Unique); Messages = $messages }
+    }
+
+    if ($Apps -contains 'Word') {
+        # v0.4 Phase 2: same pre-flight + watchdog shape as Excel - no
+        # Outlook-style backoff timer, since Word has no equivalent history
+        # of a blocking-dialog tax on every subsequent action.
+        if (-not (Get-Process -Name 'WINWORD' -ErrorAction SilentlyContinue)) {
+            # Not running - nothing to enumerate, nothing to report as busy.
+        } elseif (-not (Test-AppResponsive -ProcessName 'WINWORD' -TimeoutMs 1000)) {
+            $busyApps += 'Word'
+            $rows += [PSCustomObject]@{ App = 'Word'; RowType = 'Busy'; Name = 'Word'; Detail = 'Not responding - a dialog may be open'; Status = 'Busy'; Key = $null; Hwnd = 0; CanSave = $false; CanClose = $false }
+        } else {
+            $r = Invoke-ComTask -Command @{ Op = 'EnumWord' } -TimeoutMs 15000 -OwnerForm $OwnerForm -StatusText 'Scanning Word...'
+            if ($r.TimedOut) {
+                $busyApps += 'Word'
+                $rows += [PSCustomObject]@{ App = 'Word'; RowType = 'Busy'; Name = 'Word'; Detail = 'Not responding - a dialog may be open'; Status = 'Busy'; Key = $null; Hwnd = 0; CanSave = $false; CanClose = $false }
+            } elseif (-not $r.Ok) {
+                $messages += "Word: $($r.Message)"
+            } else {
+                $rows += $r.Rows
+                if (@($r.Rows | Where-Object { $_.RowType -eq 'Busy' }).Count -gt 0) { $busyApps += 'Word' }
+            }
+        }
+    }
+
+    # Same bail-out shape again, for the Word -> Outlook boundary.
     if ($script:ClosingRequested) {
         Write-DebugLog "Get-Snapshot ABORT-before-outlook (closing)"
         return @{ Rows = $rows; BusyApps = @($busyApps | Select-Object -Unique); Messages = $messages }
@@ -2231,6 +2525,7 @@ function New-MainForm {
         $app = $script:BtnShowDialog.Tag
         $procName = 'OUTLOOK'
         if ($app -eq 'Excel') { $procName = 'EXCEL' }
+        elseif ($app -eq 'Word') { $procName = 'WINWORD' }
         Show-BlockingDialog -ProcessName $procName | Out-Null
     })
 
