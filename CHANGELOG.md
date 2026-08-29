@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 - 2026-08-29
+
+Small follow-up release - no code changes to `WindowSweeper.ps1` beyond the
+version string.
+
+- Added `Add to Start Menu.bat` and `Remove from Start Menu.bat`, so the
+  tool can show up in Windows Start search and be pinned to the taskbar
+  like an installed program, instead of only being reachable by
+  double-clicking a file in the extracted folder. `README.txt`/`README.md`
+  updated accordingly (Desktop shortcut instructions kept as an
+  alternative).
+
 ## 0.4.0 - 2026-08-29
 
 Publish release. Four phases on top of the 0.3.1 baseline:

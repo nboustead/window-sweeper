@@ -47,13 +47,15 @@ Having trouble and want Claude to look into it? Close the tool, set
 WINDOWSWEEPER_DEBUG=1, and reopen it - a detailed log gets written to
 %USERPROFILE%\.window-sweeper\logs\debug.log.
 
-MAKE A DESKTOP SHORTCUT
-========================
-1. Right-click Run-WindowSweeper.bat in this folder.
-2. Choose "Show more options", then "Send to", then
-   "Desktop (create shortcut)". (On some versions of Windows, "Send to"
-   is already on the first right-click menu.)
-3. Rename the new Desktop icon to "Window Sweeper" if you like.
+SHOW IT IN THE START MENU
+==========================
+1. Double-click "Add to Start Menu.bat" in this folder, once.
+2. Press the Windows key and type "Window Sweeper" - it now shows up like
+   any other installed program. Right-click it there if you want to pin
+   it to the taskbar or Start.
+3. To undo this later, double-click "Remove from Start Menu.bat".
+(A plain Desktop shortcut also works: right-click Run-WindowSweeper.bat,
+"Show more options" (if needed), "Send to", "Desktop (create shortcut)".)
 
 MANUAL VERIFICATION CHECKLIST (run after any change to the tool)
 ==================================================================

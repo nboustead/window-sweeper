@@ -1,8 +1,9 @@
 <#
 Window Sweeper release builder.
 
-Packages WindowSweeper.ps1 + Run-WindowSweeper.bat + sweeper.ico + README.txt
-into release/WindowSweeper-v<version>.zip using System.IO.Compression's
+Packages WindowSweeper.ps1 + Run-WindowSweeper.bat + Add to Start Menu.bat +
+Remove from Start Menu.bat + sweeper.ico + README.txt into
+release/WindowSweeper-v<version>.zip using System.IO.Compression's
 ZipArchive with EXPLICIT, forward-slash entry names - never
 Compress-Archive, which writes backslash-separated entry paths that a
 Linux-hosted unzip (or Netlify's build) reads as one literal filename
@@ -10,11 +11,11 @@ instead of a path (house rule).
 
 Usage (from anywhere):
   powershell -File scripts\build-release.ps1
-  powershell -File scripts\build-release.ps1 -Version 0.4.1
+  powershell -File scripts\build-release.ps1 -Version 0.4.2
 #>
 
 param(
-    [string]$Version = '0.4.0'
+    [string]$Version = '0.4.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +36,8 @@ if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 $files = @(
     @{ Source = 'WindowSweeper.ps1'; Entry = 'WindowSweeper.ps1' },
     @{ Source = 'Run-WindowSweeper.bat'; Entry = 'Run-WindowSweeper.bat' },
+    @{ Source = 'Add to Start Menu.bat'; Entry = 'Add to Start Menu.bat' },
+    @{ Source = 'Remove from Start Menu.bat'; Entry = 'Remove from Start Menu.bat' },
     @{ Source = 'sweeper.ico'; Entry = 'sweeper.ico' },
     @{ Source = 'README.txt'; Entry = 'README.txt' }
 )

@@ -62,6 +62,21 @@ No execution-policy step is needed - the launcher already starts
 PowerShell with `-ExecutionPolicy Bypass` for its own child process only;
 it does not change any policy on your machine.
 
+### Show it in the Start Menu
+
+By default Window Sweeper is just a folder you double-click into. To make
+it show up like any other installed program:
+
+1. Double-click `Add to Start Menu.bat` in the extracted folder, once.
+2. Press the Windows key and type "Window Sweeper" - it appears in search
+   results just like an installed app. Right-click it there to pin it to
+   the taskbar or Start.
+3. To undo this later, double-click `Remove from Start Menu.bat`.
+
+A plain Desktop shortcut also works, if you'd rather have that: right-
+click `Run-WindowSweeper.bat` -> **Send to** -> **Desktop (create
+shortcut)**.
+
 ## Chrome tabs
 
 Out of the box, Chrome shows up as whole browser **windows** only (closing
