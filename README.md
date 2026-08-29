@@ -33,11 +33,6 @@ save state first.
 
 ## Screenshots
 
-<!-- Placeholder: the maintainer adds a fixture-data screenshot here
-     (docs/screenshot.png) before this page is published. No screenshot
-     containing real file names, email subjects, or paths is ever
-     committed to this repository. -->
-
 ![Window Sweeper screenshot](docs/screenshot.png)
 
 ## Requirements
@@ -115,3 +110,4 @@ adapters.
 ## License
 
 [MIT](LICENSE)
+
