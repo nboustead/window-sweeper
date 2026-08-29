@@ -22,6 +22,44 @@ $script:StateDir     = Join-Path $env:USERPROFILE ".window-sweeper"
 $script:LogDir        = Join-Path $script:StateDir "logs"
 $script:SettingsPath  = Join-Path $script:StateDir "settings.json"
 
+# v0.4 Phase 0: the fixed set of apps the tool knows about and the display/
+# enumeration order used throughout (filter checkboxes, row grouping, counts
+# label). Word and Chrome are seeded here ahead of their Phase 2/3 adapters -
+# they appear as filter checkboxes and grouping slots that simply produce no
+# rows until EnumWord/EnumChrome exist.
+$script:KnownApps = @('Excel', 'Word', 'Outlook', 'Chrome')
+$script:AppOrder = @{}
+for ($i = 0; $i -lt $script:KnownApps.Count; $i++) { $script:AppOrder[$script:KnownApps[$i]] = $i }
+
+# RowTypes that represent an actual open document/item (as opposed to a
+# Busy/Info/Explorer placeholder) - what Get-CountsSummary tallies per app.
+# Word adds Document/ProtectedView in Phase 2; Chrome adds Tab/BrowserWindow
+# in Phase 3.
+$script:CountableRowTypes = @('Workbook', 'Inspector')
+
+# v0.4 Phase 0: generic action routing, keyed "App|RowType" -> the op names
+# and activation style for that combination. Invoke-RowSaveClose/
+# Invoke-RowClose/Invoke-RowActivate/Invoke-BatchOp all resolve through this
+# instead of hardcoding "Excel vs everything else" - the two-app assumption
+# Sol flagged as a P1 blocker for adding Word/Chrome. An (App, RowType) with
+# no entry here (or a $null op for the action being attempted) no-ops with a
+# logged warning rather than guessing at an op name.
+# ActivateStyle 'Win32Front' = the existing Hwnd-fronting-only click behavior
+# (all COM apps, and Chrome windows once Phase 3 lands). 'CdpActivate' is
+# reserved for Phase 3 Chrome CDP tabs, which have no HWND of their own.
+$script:ActionRouting = @{
+    'Excel|Workbook'    = @{ SaveCloseOp = 'ExcelSaveClose'; CloseOp = 'ExcelClose'; SaveAsOp = 'ExcelSaveAs'; ActivateStyle = 'Win32Front' }
+    'Outlook|Inspector' = @{ SaveCloseOp = 'OutlookSaveClose'; CloseOp = 'OutlookClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+    'Outlook|Explorer'  = @{ SaveCloseOp = $null; CloseOp = 'ExplorerClose'; SaveAsOp = $null; ActivateStyle = 'Win32Front' }
+}
+
+function Get-RoutingEntry {
+    param([string]$App, [string]$RowType)
+    $key = "$App|$RowType"
+    if ($script:ActionRouting.ContainsKey($key)) { return $script:ActionRouting[$key] }
+    return $null
+}
+
 # ===== Region 1: Bootstrap + Win32 =====
 
 $win32Src = @"
@@ -137,22 +175,63 @@ function Initialize-StateDir {
 }
 
 function Get-DefaultSettings {
-    return [PSCustomObject]@{ defaultFilter = 'Both'; confirmDiscard = $true; keepOnTop = $true }
+    return [PSCustomObject]@{ selectedApps = @($script:KnownApps); confirmDiscard = $true; keepOnTop = $true }
 }
 
+# v0.4 Phase 0: selectedApps (string array) replaces the old defaultFilter
+# ('Both'/'Excel'/'Outlook') string. A settings.json still carrying the
+# legacy key (no selectedApps yet) is migrated in place - 'Both' -> every
+# known app, 'Excel'/'Outlook' -> just that one - and rewritten immediately
+# so the on-disk file reflects the v0.4 shape from the very next load, not
+# just whenever the window next closes.
 function Get-Settings {
     if (-not (Test-Path $script:SettingsPath)) { return Get-DefaultSettings }
     try {
         $obj = Get-Content -Path $script:SettingsPath -Raw | ConvertFrom-Json
         $result = Get-DefaultSettings
-        if ($obj.PSObject.Properties.Match('defaultFilter').Count -gt 0 -and @('Both', 'Excel', 'Outlook') -contains $obj.defaultFilter) {
-            $result.defaultFilter = $obj.defaultFilter
+        $needsRewrite = $false
+        $hasSelectedApps = $obj.PSObject.Properties.Match('selectedApps').Count -gt 0
+        $hasDefaultFilter = $obj.PSObject.Properties.Match('defaultFilter').Count -gt 0
+        if ($hasSelectedApps -and ($obj.selectedApps -is [System.Array])) {
+            # An explicit selectedApps ARRAY is authoritative - including an
+            # explicit [] (Nick unchecked every app). Only a real JSON array
+            # counts: null / a bare string / an object are malformed and fall
+            # through to the legacy-filter or default paths instead of
+            # silently becoming "no apps". A non-empty array whose entries
+            # are ALL unrecognized is likewise treated as malformed.
+            $apps = @($obj.selectedApps | Where-Object { $script:KnownApps -contains $_ } | Select-Object -Unique)
+            if ($apps.Count -gt 0 -or @($obj.selectedApps).Count -eq 0) {
+                $result.selectedApps = $apps
+            } elseif ($hasDefaultFilter) {
+                switch ($obj.defaultFilter) {
+                    'Excel'   { $result.selectedApps = @('Excel') }
+                    'Outlook' { $result.selectedApps = @('Outlook') }
+                    default   { $result.selectedApps = @($script:KnownApps) }
+                }
+            }
+        } elseif ($hasDefaultFilter) {
+            switch ($obj.defaultFilter) {
+                'Excel'   { $result.selectedApps = @('Excel') }
+                'Outlook' { $result.selectedApps = @('Outlook') }
+                default   { $result.selectedApps = @($script:KnownApps) }
+            }
         }
+        # Legacy key removal is unconditional on defaultFilter being present
+        # at all - even a file that already has a (now-authoritative)
+        # selectedApps can still be carrying a stale defaultFilter alongside
+        # it, and that must not survive to the next load either.
+        if ($hasDefaultFilter) { $needsRewrite = $true }
         if ($obj.PSObject.Properties.Match('confirmDiscard').Count -gt 0) {
             $result.confirmDiscard = [bool]$obj.confirmDiscard
         }
         if ($obj.PSObject.Properties.Match('keepOnTop').Count -gt 0) {
             $result.keepOnTop = [bool]$obj.keepOnTop
+        }
+        if ($needsRewrite) {
+            # Migration write: drops the legacy defaultFilter key for good
+            # (the migrated $result object never had one) while preserving
+            # whatever selectedApps was already authoritative above.
+            Save-Settings -Settings $result
         }
         return $result
     } catch {
@@ -164,7 +243,7 @@ function Save-Settings {
     param($Settings)
     try {
         Initialize-StateDir
-        $Settings | ConvertTo-Json | Set-Content -Path $script:SettingsPath -Encoding UTF8
+        $Settings | ConvertTo-Json -Depth 5 | Set-Content -Path $script:SettingsPath -Encoding UTF8
     } catch {
         # non-fatal
     }
@@ -941,30 +1020,40 @@ $script:WorkerScript = {
 
 # ===== Region 4: Snapshot orchestration =====
 
+# v0.4 Phase 0/1: app-agnostic - loops $script:KnownApps in display order so
+# the label reads "12 Excel | 3 Word | 6 Outlook - 4 unsaved" with an app
+# dropped entirely once it has zero rows, instead of a fixed two-app
+# "N workbooks, N emails" sentence.
 function Get-CountsSummary {
     param($rows)
-    $wbRows = @($rows | Where-Object { $_.RowType -eq 'Workbook' })
-    $mailRows = @($rows | Where-Object { $_.RowType -eq 'Inspector' })
-    $unsaved = @($rows | Where-Object { ($_.RowType -eq 'Workbook' -or $_.RowType -eq 'Inspector') -and ($_.Status -eq 'UNSAVED' -or $_.Status -eq 'Never saved') })
-    $wbWord = 'workbooks'
-    if ($wbRows.Count -eq 1) { $wbWord = 'workbook' }
-    $mailWord = 'emails'
-    if ($mailRows.Count -eq 1) { $mailWord = 'email' }
-    $text = "$($wbRows.Count) $wbWord, $($mailRows.Count) $mailWord"
+    $countable = @($rows | Where-Object { $script:CountableRowTypes -contains $_.RowType })
+    $parts = @()
+    foreach ($app in $script:KnownApps) {
+        $appRows = @($countable | Where-Object { $_.App -eq $app })
+        if ($appRows.Count -eq 0) { continue }
+        $parts += "$($appRows.Count) $app"
+    }
+    $text = $parts -join ' | '
+    if (-not $text) { $text = 'Nothing open' }
+    $unsaved = @($countable | Where-Object { $_.Status -eq 'UNSAVED' -or $_.Status -eq 'Never saved' })
     if ($unsaved.Count -gt 0) { $text += " - $($unsaved.Count) unsaved" }
     return $text
 }
 
 # Each app is enumerated through its own Invoke-ComTask call, so a busy
-# Outlook never blocks Excel results (or vice versa).
+# Outlook never blocks Excel results (or vice versa). Apps is a string array
+# (v0.4 Phase 0 - replaces the old 'Both'/'Excel'/'Outlook' -Filter string so
+# Get-Snapshot generalizes to N apps); Word/Chrome are valid entries with no
+# case below yet - they simply contribute no rows until their Phase 2/3
+# adapters land.
 function Get-Snapshot {
-    param([string]$Filter, $OwnerForm, [bool]$ForceOutlookRetry = $false)
+    param([string[]]$Apps, $OwnerForm, [bool]$ForceOutlookRetry = $false)
 
     $rows = @()
     $busyApps = @()
     $messages = @()
 
-    if ($Filter -eq 'Both' -or $Filter -eq 'Excel') {
+    if ($Apps -contains 'Excel') {
         if (-not (Get-Process -Name 'EXCEL' -ErrorAction SilentlyContinue)) {
             # Not running - nothing to enumerate, nothing to report as busy.
         } elseif (-not (Test-AppResponsive -ProcessName 'EXCEL' -TimeoutMs 1000)) {
@@ -998,7 +1087,7 @@ function Get-Snapshot {
         return @{ Rows = $rows; BusyApps = @($busyApps | Select-Object -Unique); Messages = $messages }
     }
 
-    if ($Filter -eq 'Both' -or $Filter -eq 'Outlook') {
+    if ($Apps -contains 'Outlook') {
         # v0.3 backoff: once Outlook is found busy/timed-out, skip actually
         # touching it for 60s - just keep showing a busy placeholder. This is
         # the fix for the +20s tax that was landing on every single action
@@ -1053,9 +1142,9 @@ function Get-Snapshot {
 
 function Invoke-DiagMode {
     Initialize-StateDir
-    $snap = Get-Snapshot -Filter 'Both' -OwnerForm $null
+    $snap = Get-Snapshot -Apps $script:KnownApps -OwnerForm $null
     Write-Host ''
-    Write-Host 'Window Sweeper v0.3 - Diagnostic Enumeration' -ForegroundColor Cyan
+    Write-Host 'Window Sweeper v0.4.0-dev - Diagnostic Enumeration' -ForegroundColor Cyan
     Write-Host ('-' * 74)
     $fmt = '{0,-8} {1,-30} {2,-24} {3,-10}'
     Write-Host ($fmt -f 'App', 'Name', 'Detail', 'Status')
@@ -1083,9 +1172,233 @@ if ($Diag) {
     [Environment]::Exit(0)
 }
 
+# ===== Region 4c: Visual assets (v0.4 Phase 1) =====
+# GUI-only helpers - app icons, the generated window icon, and the shared
+# rounded-rect path used by both the status pills and the .ico glyph. Never
+# referenced from -Diag/NOGUI, so no cost when the GUI never shows.
+
+# App Paths is normally not WOW64-redirected for these installers, but a
+# WOW6432Node fallback costs nothing and covers the odd machine where it is.
+function Get-AppIconExePath {
+    param([string]$ExeName)
+    $candidates = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
+    )
+    foreach ($regPath in $candidates) {
+        try {
+            if (-not (Test-Path $regPath)) { continue }
+            $item = Get-Item -Path $regPath -ErrorAction Stop
+            $exePath = $item.GetValue('')
+            if ($exePath -and (Test-Path $exePath)) { return $exePath }
+        } catch {}
+    }
+    return $null
+}
+
+# Builds the App=>20x20 bitmap cache once at startup. Any failure for a given
+# app (no App Paths entry, ExtractAssociatedIcon throws, etc.) leaves that
+# app's slot $null - Update-Grid and the CellPainting icon column both treat
+# a $null image as "draw nothing," never an error.
+function Initialize-AppIcons {
+    $script:AppIcons = @{}
+    $exeMap = @{ 'Excel' = 'EXCEL.EXE'; 'Outlook' = 'OUTLOOK.EXE'; 'Word' = 'WINWORD.EXE'; 'Chrome' = 'chrome.exe' }
+    foreach ($appName in $script:KnownApps) {
+        $img = $null
+        try {
+            $exeName = $exeMap[$appName]
+            if ($exeName) {
+                $exePath = Get-AppIconExePath -ExeName $exeName
+                if ($exePath) {
+                    $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+                    if ($icon) {
+                        $bmp = New-Object System.Drawing.Bitmap 20, 20
+                        $g = [System.Drawing.Graphics]::FromImage($bmp)
+                        try {
+                            $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                            $g.DrawIcon($icon, (New-Object System.Drawing.Rectangle 0, 0, 20, 20))
+                        } finally { $g.Dispose() }
+                        $img = $bmp
+                        $icon.Dispose()
+                    }
+                }
+            }
+        } catch {
+            Write-DebugLog "Initialize-AppIcons EXCEPTION App=$appName Message=$($_.Exception.Message)"
+            $img = $null
+        }
+        $script:AppIcons[$appName] = $img
+    }
+}
+
+# Shared by the Status-pill CellPainting and the generated window icon -
+# GDI+ has no native rounded-rect fill, so both build one from four corner
+# arcs. The path's geometry always depends on the caller's rectangle, so
+# (unlike the brushes/pens/fonts) this one is necessarily built per call.
+function New-RoundedRectPath {
+    param([System.Drawing.Rectangle]$Rect, [int]$Radius)
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = $Radius * 2
+    if ($d -gt $Rect.Width) { $d = $Rect.Width }
+    if ($d -gt $Rect.Height) { $d = $Rect.Height }
+    if ($d -lt 1) {
+        $path.AddRectangle($Rect)
+        return $path
+    }
+    $path.AddArc($Rect.X, $Rect.Y, $d, $d, 180, 90)
+    $path.AddArc($Rect.Right - $d, $Rect.Y, $d, $d, 270, 90)
+    $path.AddArc($Rect.Right - $d, $Rect.Bottom - $d, $d, $d, 0, 90)
+    $path.AddArc($Rect.X, $Rect.Bottom - $d, $d, $d, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+# Raw BMP-format (DIB) ICO writer - not the newer PNG-compressed ICO entry
+# format, which System.Drawing.Icon has historically been unreliable loading
+# back for anything other than a 256px entry. A 32bpp DIB with alpha, bottom
+# up, followed by an all-zero (fully opaque) AND mask is the traditional
+# format every Windows/.NET Icon reader has always supported.
+function Get-DibBytesFromBitmap {
+    param([System.Drawing.Bitmap]$Bmp)
+    $w = $Bmp.Width; $h = $Bmp.Height
+    $rect = New-Object System.Drawing.Rectangle 0, 0, $w, $h
+    $bmpData = $Bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try {
+        $stride = [Math]::Abs($bmpData.Stride)
+        $totalBytes = $stride * $h
+        $buf = New-Object byte[] $totalBytes
+        [System.Runtime.InteropServices.Marshal]::Copy($bmpData.Scan0, $buf, 0, $totalBytes)
+    } finally {
+        $Bmp.UnlockBits($bmpData)
+    }
+    # .NET hands back rows top-down; a DIB wants them bottom-up - reverse row order.
+    $out = New-Object byte[] $totalBytes
+    for ($r = 0; $r -lt $h; $r++) {
+        $srcOffset = $r * $stride
+        $dstOffset = ($h - 1 - $r) * $stride
+        [Array]::Copy($buf, $srcOffset, $out, $dstOffset, $stride)
+    }
+    return $out
+}
+
+function New-IcoImageData {
+    param([System.Drawing.Bitmap]$Bmp)
+    $w = $Bmp.Width; $h = $Bmp.Height
+    # [byte[]] cast is load-bearing: a bare `return $out` from
+    # Get-DibBytesFromBitmap crosses a PowerShell function-return boundary,
+    # which unrolls the array and hands the caller a generic System.Object[]
+    # instead of a true System.Byte[] - BinaryWriter.Write() below then binds
+    # to the wrong overload and silently writes far fewer bytes than expected
+    # (confirmed by direct repro), producing a truncated, unloadable .ico.
+    $xorBytes = [byte[]](Get-DibBytesFromBitmap -Bmp $Bmp)
+    $maskRowBytes = [int]([Math]::Ceiling($w / 32.0) * 4)
+    $maskBytes = New-Object byte[] ($maskRowBytes * $h)  # all zero => fully opaque via the alpha channel
+    $ms = New-Object System.IO.MemoryStream
+    $bw = New-Object System.IO.BinaryWriter $ms
+    $bw.Write([int32]40)                                            # biSize (BITMAPINFOHEADER)
+    $bw.Write([int32]$w)                                            # biWidth
+    $bw.Write([int32]($h * 2))                                      # biHeight (XOR + AND)
+    $bw.Write([uint16]1)                                            # biPlanes
+    $bw.Write([uint16]32)                                           # biBitCount
+    $bw.Write([int32]0)                                             # biCompression (BI_RGB)
+    $bw.Write([int32]($xorBytes.Length + $maskBytes.Length))        # biSizeImage
+    $bw.Write([int32]0); $bw.Write([int32]0)                        # biXPelsPerMeter/biYPelsPerMeter
+    $bw.Write([int32]0); $bw.Write([int32]0)                        # biClrUsed/biClrImportant
+    $bw.Write($xorBytes)
+    $bw.Write($maskBytes)
+    $bw.Flush()
+    $result = $ms.ToArray()
+    $bw.Dispose(); $ms.Dispose()
+    return $result
+}
+
+# The 32x32/16x16 glyph itself: a #217346-to-#0F6CBD split rounded square
+# with a white 'W', deterministic (no randomness) so re-running this never
+# produces a visibly different icon.
+function New-SweeperIconBitmap {
+    param([int]$Size)
+    $bmp = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $rect = New-Object System.Drawing.Rectangle 0, 0, $Size, $Size
+        $radius = [Math]::Max(2, [int]($Size * 0.18))
+        $path = New-RoundedRectPath -Rect $rect -Radius $radius
+        $g.SetClip($path)
+        $b1 = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml('#217346'))
+        $b2 = New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml('#0F6CBD'))
+        $half = [int]($Size / 2)
+        $g.FillRectangle($b1, 0, 0, $Size, $half)
+        $g.FillRectangle($b2, 0, $half, $Size, $Size - $half)
+        $g.ResetClip()
+        $fontSize = [Math]::Max(6, [Math]::Round($Size * 0.5, 1))
+        $font = New-Object System.Drawing.Font('Segoe UI', $fontSize, [System.Drawing.FontStyle]::Bold)
+        $sf = New-Object System.Drawing.StringFormat
+        $sf.Alignment = [System.Drawing.StringAlignment]::Center
+        $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $g.DrawString('W', $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 0, $Size, $Size), $sf)
+        $b1.Dispose(); $b2.Dispose(); $font.Dispose(); $path.Dispose()
+    } finally {
+        $g.Dispose()
+    }
+    return $bmp
+}
+
+# Generated once and shipped beside the ps1 - a no-op if the file already
+# exists (repo copy, or a previous run already made one).
+function New-SweeperIcoFile {
+    param([string]$Path)
+    if (Test-Path $Path) { return }
+    try {
+        $sizes = @(32, 16)
+        $entries = @()
+        foreach ($sz in $sizes) {
+            $bmp = New-SweeperIconBitmap -Size $sz
+            # [byte[]] cast - same function-return unrolling gotcha as above.
+            $data = [byte[]](New-IcoImageData -Bmp $bmp)
+            $entries += [PSCustomObject]@{ Size = $sz; Data = $data }
+            $bmp.Dispose()
+        }
+        $ms = New-Object System.IO.MemoryStream
+        $bw = New-Object System.IO.BinaryWriter $ms
+        $bw.Write([uint16]0); $bw.Write([uint16]1); $bw.Write([uint16]$entries.Count)  # ICONDIR
+        $offset = 6 + (16 * $entries.Count)
+        foreach ($e in $entries) {
+            $wByte = $e.Size; if ($wByte -ge 256) { $wByte = 0 }
+            $bw.Write([byte]$wByte); $bw.Write([byte]$wByte)   # width/height (0 = 256)
+            $bw.Write([byte]0); $bw.Write([byte]0)             # color count, reserved
+            $bw.Write([uint16]1); $bw.Write([uint16]32)        # planes, bit count
+            $bw.Write([uint32]$e.Data.Length)
+            $bw.Write([uint32]$offset)
+            $offset += $e.Data.Length
+        }
+        foreach ($e in $entries) { $bw.Write($e.Data) }
+        $bw.Flush()
+        [System.IO.File]::WriteAllBytes($Path, $ms.ToArray())
+        $bw.Dispose(); $ms.Dispose()
+    } catch {
+        Write-DebugLog "New-SweeperIcoFile EXCEPTION $($_.Exception.Message)"
+    }
+}
+
+# Top/bottom-bar buttons only - grid BUTTON columns (SaveClose/Close) stay
+# system-drawn per plan, so this is never called on those.
+function Set-FlatButtonStyle {
+    param($Button)
+    $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $Button.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(200, 200, 200)
+    $Button.FlatAppearance.MouseOverBackColor = [System.Drawing.Color]::FromArgb(232, 240, 254)
+}
+
+function New-HtmlBrush {
+    param([string]$Hex)
+    return New-Object System.Drawing.SolidBrush ([System.Drawing.ColorTranslator]::FromHtml($Hex))
+}
+
 # ===== Region 5: UI =====
 
-$script:CurrentFilter = 'Both'
+$script:SelectedApps = @($script:KnownApps)
 $script:SkipDiscardConfirmThisSession = $false
 $script:MainForm = $null
 $script:Grid = $null
@@ -1146,6 +1459,9 @@ function Update-Grid {
         try {
             $i = $script:Grid.Rows.Add()
             $gridRow = $script:Grid.Rows[$i]
+            $icon = $null
+            if ($script:AppIcons -and $script:AppIcons.ContainsKey($row.App)) { $icon = $script:AppIcons[$row.App] }
+            $gridRow.Cells['Icon'].Value = $icon
             $gridRow.Cells['App'].Value = $row.App
             $gridRow.Cells['Name'].Value = $row.Name
             $gridRow.Cells['Detail'].Value = "$($row.Detail)"
@@ -1157,14 +1473,9 @@ function Update-Grid {
             $gridRow.Cells['SaveClose'].Value = $saveText
             $gridRow.Cells['Close'].Value = $closeText
             $gridRow.Tag = $row
-            if ($row.Status -eq 'UNSAVED') {
-                $gridRow.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::FromArgb(180, 0, 0)
-                $gridRow.Cells['Status'].Style.Font = New-Object System.Drawing.Font($script:Grid.Font, [System.Drawing.FontStyle]::Bold)
-            } elseif ($row.Status -eq 'Never saved') {
-                $gridRow.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::FromArgb(180, 95, 0)
-            } elseif ($row.Status -eq 'Saved') {
-                $gridRow.Cells['Status'].Style.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 0)
-            }
+            # v0.4 Phase 1: per-row Status.Style coloring is superseded by the
+            # CellPainting rounded-pill rendering (accent stripe + badge) -
+            # no per-row Font/Brush allocation here anymore.
             $addedCount++
         } catch {
             Write-DebugLog "Update-Grid ROW-EXCEPTION name=$($row.Name) app=$($row.App) Message=$($_.Exception.Message) Stack=$($_.ScriptStackTrace)"
@@ -1184,9 +1495,22 @@ function Update-Grid {
 # silently prevent the others from running - a partial failure ends up
 # logged and visible (counts/timestamp/banner still reflect reality) instead
 # of leaving the grid and the rest of the UI disagreeing with each other.
+# v0.4 Phase 1: rows are sorted app-grouped (fixed order Excel, Word,
+# Outlook, Chrome; then by Name) right before they hit the grid - the single
+# convergence point both Do-FullRefresh and Do-ScopedRefresh funnel through,
+# so scoped (per-app) refreshes stay correctly grouped too.
+function Sort-RowsForDisplay {
+    param($Rows)
+    return @($Rows | Sort-Object -Property @{ Expression = {
+        if ($script:AppOrder.ContainsKey($_.App)) { $script:AppOrder[$_.App] } else { 99 }
+    } }, @{ Expression = 'Name' })
+}
+
 function Update-RefreshedUi {
     param($Rows, $BusyApps)
-    try { Update-Grid -rows $Rows } catch { Write-DebugLog "Update-RefreshedUi Update-Grid EXCEPTION $($_.Exception.Message) Stack=$($_.ScriptStackTrace)" }
+    $sorted = $Rows
+    try { $sorted = Sort-RowsForDisplay -Rows $Rows } catch { Write-DebugLog "Update-RefreshedUi Sort EXCEPTION $($_.Exception.Message)"; $sorted = $Rows }
+    try { Update-Grid -rows $sorted } catch { Write-DebugLog "Update-RefreshedUi Update-Grid EXCEPTION $($_.Exception.Message) Stack=$($_.ScriptStackTrace)" }
     try { $script:LblCounts.Text = Get-CountsSummary -rows $Rows } catch { Write-DebugLog "Update-RefreshedUi LblCounts EXCEPTION $($_.Exception.Message)" }
     try { $script:LblTimestamp.Text = 'Last refreshed: ' + (Get-Date -Format 'h:mm:ss tt') } catch {}
     try { Update-BusyBanner -BusyApps $BusyApps } catch { Write-DebugLog "Update-RefreshedUi Update-BusyBanner EXCEPTION $($_.Exception.Message)" }
@@ -1194,9 +1518,9 @@ function Update-RefreshedUi {
 
 function Do-FullRefresh {
     param([bool]$ForceOutlookRetry = $false)
-    Write-DebugLog "Do-FullRefresh ENTER ForceOutlookRetry=$ForceOutlookRetry Filter=$script:CurrentFilter Closing=$script:ClosingRequested"
+    Write-DebugLog "Do-FullRefresh ENTER ForceOutlookRetry=$ForceOutlookRetry Apps=$($script:SelectedApps -join ',') Closing=$script:ClosingRequested"
     if ($script:ClosingRequested) { Write-DebugLog "Do-FullRefresh ABORT (closing)"; return }
-    $snap = Get-Snapshot -Filter $script:CurrentFilter -OwnerForm $script:MainForm -ForceOutlookRetry $ForceOutlookRetry
+    $snap = Get-Snapshot -Apps $script:SelectedApps -OwnerForm $script:MainForm -ForceOutlookRetry $ForceOutlookRetry
     if ($script:ClosingRequested) { Write-DebugLog "Do-FullRefresh ABORT-post-snapshot (closing)"; return }
     $script:LastSnapshotRows = $snap.Rows
     $script:LastBusyApps = $snap.BusyApps
@@ -1216,8 +1540,8 @@ function Do-ScopedRefresh {
     param([string]$App, [bool]$ForceOutlookRetry = $false)
     Write-DebugLog "Do-ScopedRefresh ENTER App=$App ForceOutlookRetry=$ForceOutlookRetry Closing=$script:ClosingRequested"
     if ($script:ClosingRequested) { Write-DebugLog "Do-ScopedRefresh ABORT (closing)"; return }
-    if ($script:CurrentFilter -ne 'Both' -and $script:CurrentFilter -ne $App) { return }
-    $snap = Get-Snapshot -Filter $App -OwnerForm $script:MainForm -ForceOutlookRetry $ForceOutlookRetry
+    if ($script:SelectedApps -notcontains $App) { return }
+    $snap = Get-Snapshot -Apps @($App) -OwnerForm $script:MainForm -ForceOutlookRetry $ForceOutlookRetry
     if ($script:ClosingRequested) { Write-DebugLog "Do-ScopedRefresh ABORT-post-snapshot (closing)"; return }
     $otherRows = @($script:LastSnapshotRows | Where-Object { $_.App -ne $App })
     $mergedRows = @($otherRows) + @($snap.Rows)
@@ -1319,34 +1643,61 @@ function Request-DeferredRefresh {
 # deciding what to do with it). The Hwnd was already captured at enum time
 # for exactly this; a click now just fronts it directly. ExcelActivate/
 # OutlookActivate worker ops still exist but nothing calls them from here.
+# v0.4 Phase 0: which (App, RowType) combos are even clickable, and how, now
+# comes from the routing table rather than a hardcoded RowType whitelist -
+# an unrecognized combo (or a future CdpActivate style not implemented yet)
+# no-ops with a logged warning instead of guessing. Rows with no Hwnd
+# captured at enum time (Busy/Info/Explorer) still silently no-op exactly as
+# before - the routing lookup just adds a debug breadcrumb on top.
 function Invoke-RowActivate {
     param($Row)
-    if ($Row.RowType -ne 'Workbook' -and $Row.RowType -ne 'Inspector') { return }
+    $route = Get-RoutingEntry -App $Row.App -RowType $Row.RowType
+    if (-not $route) {
+        Write-DebugLog "Invoke-RowActivate NO-ROUTE App=$($Row.App) RowType=$($Row.RowType)"
+        return
+    }
+    if ($route.ActivateStyle -ne 'Win32Front') {
+        Write-DebugLog "Invoke-RowActivate UNHANDLED-STYLE App=$($Row.App) RowType=$($Row.RowType) Style=$($route.ActivateStyle)"
+        return
+    }
     if (-not $Row.Hwnd -or $Row.Hwnd -eq 0) { return }  # no unique window captured - silent no-op
     $h = [IntPtr]$Row.Hwnd
     [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null
     [SweeperWin32]::SetForegroundWindow($h) | Out-Null
 }
 
+# v0.4 Phase 0: op names now come from the routing table instead of an
+# Excel-vs-everything-else hardcode. A row with no SaveCloseOp routed for its
+# (App, RowType) no-ops with a logged warning rather than guessing - it
+# should never actually happen, since CellContentClick only calls this for
+# rows with CanSave=true, which only ever comes from RowTypes that have a
+# SaveCloseOp seeded.
 function Invoke-RowSaveClose {
     param($Row)
-    $op = 'OutlookSaveClose'
-    if ($Row.App -eq 'Excel') { $op = 'ExcelSaveClose' }
-    $result = Invoke-ComTask -Command @{ Op = $op; Key = $Row.Key } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "Saving $($Row.Name)..."
+    $route = Get-RoutingEntry -App $Row.App -RowType $Row.RowType
+    if (-not $route -or -not $route.SaveCloseOp) {
+        Write-DebugLog "Invoke-RowSaveClose NO-ROUTE App=$($Row.App) RowType=$($Row.RowType)"
+        return
+    }
+    $result = Invoke-ComTask -Command @{ Op = $route.SaveCloseOp; Key = $Row.Key } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "Saving $($Row.Name)..."
     if ($result.TimedOut) { Request-DeferredRefresh -App $Row.App; return }
     if ($result.NeedsSaveAs) {
-        # Excel's native Save As dialog opens behind a TopMost sweeper -
-        # observed live (the dialog existed, just invisible, foreground
-        # stuck on the sweeper). Drop TopMost only for this one blocking
-        # call so the dialog can actually come to the front, then restore
-        # whatever the user had it set to.
-        $wasTopMost = $false
-        try { $wasTopMost = $script:MainForm.TopMost } catch {}
-        try {
-            if ($wasTopMost) { try { $script:MainForm.TopMost = $false } catch {} }
-            $result = Invoke-ComTask -Command @{ Op = 'ExcelSaveAs'; Key = $Row.Key } -TimeoutMs 180000 -OwnerForm $script:MainForm -StatusText 'Waiting for you to finish Save As in Excel...'
-        } finally {
-            if ($wasTopMost) { try { $script:MainForm.TopMost = $true } catch {} }
+        if (-not $route.SaveAsOp) {
+            Write-DebugLog "Invoke-RowSaveClose NEEDS-SAVEAS-NO-ROUTE App=$($Row.App) RowType=$($Row.RowType)"
+        } else {
+            # Excel's native Save As dialog opens behind a TopMost sweeper -
+            # observed live (the dialog existed, just invisible, foreground
+            # stuck on the sweeper). Drop TopMost only for this one blocking
+            # call so the dialog can actually come to the front, then restore
+            # whatever the user had it set to.
+            $wasTopMost = $false
+            try { $wasTopMost = $script:MainForm.TopMost } catch {}
+            try {
+                if ($wasTopMost) { try { $script:MainForm.TopMost = $false } catch {} }
+                $result = Invoke-ComTask -Command @{ Op = $route.SaveAsOp; Key = $Row.Key } -TimeoutMs 180000 -OwnerForm $script:MainForm -StatusText 'Waiting for you to finish Save As...'
+            } finally {
+                if ($wasTopMost) { try { $script:MainForm.TopMost = $true } catch {} }
+            }
         }
     }
     Write-ActionLog -App $Row.App -Name $Row.Name -Action 'SaveClose' -Result $result -Path $Row.Detail
@@ -1362,16 +1713,20 @@ function Invoke-RowSaveClose {
 # dialog is shown and the op is re-issued with ConfirmedDiscard=$true. Rows
 # already showing UNSAVED/Never saved confirm up front as before, then send
 # ConfirmedDiscard=$true directly (no need for the round trip).
+# v0.4 Phase 0: the RowType 'Explorer' special case folds into the generic
+# routing lookup below (Outlook|Explorer -> CloseOp='ExplorerClose') - no
+# functional change, since Explorer rows' Status is always 'Window' (never
+# UNSAVED/Never saved) so the discard-confirm gate below was always a no-op
+# for them anyway, and the worker's ExplorerClose case never reads
+# cmd.ConfirmedDiscard.
 function Invoke-RowClose {
     param($Row)
-    if ($Row.RowType -eq 'Explorer') {
-        $result = Invoke-ComTask -Command @{ Op = 'ExplorerClose'; Key = $Row.Key } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "Closing $($Row.Name)..."
-        Write-ActionLog -App $Row.App -Name $Row.Name -Action 'Close' -Result $result -Path $Row.Detail
-        Request-DeferredRefresh -App $Row.App
+    $route = Get-RoutingEntry -App $Row.App -RowType $Row.RowType
+    if (-not $route -or -not $route.CloseOp) {
+        Write-DebugLog "Invoke-RowClose NO-ROUTE App=$($Row.App) RowType=$($Row.RowType)"
         return
     }
-    $op = 'OutlookClose'
-    if ($Row.App -eq 'Excel') { $op = 'ExcelClose' }
+    $op = $route.CloseOp
 
     $confirmedDiscard = $false
     if ($Row.Status -eq 'UNSAVED' -or $Row.Status -eq 'Never saved') {
@@ -1394,13 +1749,28 @@ function Invoke-RowClose {
 # row in the batch (Save ops ignore it); a row whose live state turns out to
 # have changed since the last Refresh comes back as NeedsConfirm and is
 # tallied as Skipped rather than silently forced through.
+# v0.4 Phase 0: OpKind ('SaveCloseOp' or 'CloseOp') selects which field of
+# the row's routing-table entry to use, replacing the old App-only
+# OpNameForApp scriptblock - resolution is now per (App, RowType), so a
+# batch spanning multiple RowTypes (e.g. Outlook Inspectors + Explorers)
+# routes each row correctly. A row with no route (should not happen given
+# the CanSave/CanClose gating upstream, but never guessed at) is tallied
+# Failed with a logged warning.
 function Invoke-BatchOp {
-    param([array]$Rows, [string]$ActionLabel, [scriptblock]$OpNameForApp, [bool]$ConfirmedDiscard = $false)
+    param([array]$Rows, [string]$ActionLabel, [string]$OpKind, [bool]$ConfirmedDiscard = $false)
     $timedOutApps = @{}
     $counts = @{ Ok = 0; Failed = 0; Skipped = 0 }
     foreach ($row in $Rows) {
         if ($timedOutApps.ContainsKey($row.App)) { continue }
-        $op = & $OpNameForApp $row.App
+        $route = Get-RoutingEntry -App $row.App -RowType $row.RowType
+        $op = $null
+        if ($route) { $op = $route[$OpKind] }
+        if (-not $op) {
+            Write-DebugLog "Invoke-BatchOp NO-ROUTE App=$($row.App) RowType=$($row.RowType) OpKind=$OpKind"
+            $counts.Failed++
+            Write-ActionLog -App $row.App -Name $row.Name -Action $ActionLabel -Result @{ Ok = $false; Message = 'No routing for this row type' } -Path $row.Detail
+            continue
+        }
         $verb = 'Processing'
         if ($ActionLabel -eq 'SaveClose') { $verb = 'Saving' } elseif ($ActionLabel -eq 'Close') { $verb = 'Closing' }
         $result = Invoke-ComTask -Command @{ Op = $op; Key = $row.Key; ConfirmedDiscard = $ConfirmedDiscard } -TimeoutMs 10000 -OwnerForm $script:MainForm -StatusText "$verb $($row.Name)..."
@@ -1421,13 +1791,20 @@ function Invoke-BatchOp {
     return $counts
 }
 
+# v0.4 Phase 0: Save & Close All scoping is unchanged in effect - CanSave
+# rows, excluding pathless never-saved ones, which are tallied separately
+# rather than silently attempted (a never-saved row's own Save&Close is what
+# drives the native Save As dialog; the batch path has nowhere to show it).
+# The RowType -eq 'Workbook'/'Inspector' restriction is dropped since it was
+# always redundant with CanSave (only those two RowTypes ever set it true)
+# and this generalizes cleanly to Word's Document rows in Phase 2.
 function Invoke-SaveAll {
     $all = @($script:Grid.Tag)
-    $rows = @($all | Where-Object { $_.CanSave -and ($_.RowType -eq 'Workbook' -or $_.RowType -eq 'Inspector') -and $_.Status -ne 'Never saved' })
-    $skipped = @($all | Where-Object { $_.RowType -eq 'Workbook' -and $_.Status -eq 'Never saved' }).Count
-    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'SaveClose' -OpNameForApp { param($app) if ($app -eq 'Excel') { 'ExcelSaveClose' } else { 'OutlookSaveClose' } }
+    $rows = @($all | Where-Object { $_.CanSave -and $_.Status -ne 'Never saved' })
+    $skipped = @($all | Where-Object { $_.CanSave -and $_.Status -eq 'Never saved' }).Count
+    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'SaveClose' -OpKind 'SaveCloseOp'
     Do-RefreshForApps -Apps @($rows | ForEach-Object { $_.App })
-    [System.Windows.Forms.MessageBox]::Show($script:MainForm, "Saved and closed: $($counts.Ok)`r`nSkipped (never saved): $skipped`r`nFailed: $($counts.Failed)", 'Save & Close All', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    [System.Windows.Forms.MessageBox]::Show($script:MainForm, "Saved and closed: $($counts.Ok)`r`nNever-saved - skipped (use the row's own Save & Close): $skipped`r`nFailed: $($counts.Failed)", 'Save & Close All', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 }
 
 # "Zero-risk, no confirm" per design - but that premise only holds if the
@@ -1435,30 +1812,39 @@ function Invoke-SaveAll {
 # (Nick could have edited a row after the last Refresh). Every row is sent
 # with ConfirmedDiscard=$false; the worker's live re-check catches any row
 # that has actually gone unsaved since, and it is skipped rather than closed.
+# Per plan: Status 'Saved' rows only - Chrome tabs (Phase 3) will never carry
+# that status, so they never appear in this batch.
 function Invoke-CloseAllSaved {
-    $rows = @($script:Grid.Tag | Where-Object { $_.CanClose -and $_.Status -eq 'Saved' -and ($_.RowType -eq 'Workbook' -or $_.RowType -eq 'Inspector') })
-    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'Close' -OpNameForApp { param($app) if ($app -eq 'Excel') { 'ExcelClose' } else { 'OutlookClose' } } -ConfirmedDiscard $false
+    $rows = @($script:Grid.Tag | Where-Object { $_.CanClose -and $_.Status -eq 'Saved' })
+    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'Close' -OpKind 'CloseOp' -ConfirmedDiscard $false
     Do-RefreshForApps -Apps @($rows | ForEach-Object { $_.App })
     [System.Windows.Forms.MessageBox]::Show($script:MainForm, "Closed: $($counts.Ok)`r`nChanged since refresh - skipped: $($counts.Skipped)`r`nFailed: $($counts.Failed)", 'Close All Saved', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 }
 
+# v0.4 Phase 0: broadened from "unsaved/never-saved rows only" to ALL
+# closable rows, per plan - Chrome tabs (Phase 3) have no save state at all,
+# so this batch is the only way they ever get swept in bulk. For today's
+# Excel/Outlook-only world this also means an already-Saved row (or an
+# Outlook folder window - Explorer rows are CanClose too) can be included in
+# the batch alongside truly-unsaved ones; the discard confirm still lists
+# every row by name before anything closes.
 function Invoke-CloseAllDiscard {
-    $rows = @($script:Grid.Tag | Where-Object { $_.CanClose -and ($_.Status -eq 'UNSAVED' -or $_.Status -eq 'Never saved') -and ($_.RowType -eq 'Workbook' -or $_.RowType -eq 'Inspector') })
+    $rows = @($script:Grid.Tag | Where-Object { $_.CanClose })
     if ($rows.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show($script:MainForm, 'Nothing unsaved to discard.', 'Close All and Discard', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        [System.Windows.Forms.MessageBox]::Show($script:MainForm, 'Nothing to close.', 'Close All and Discard', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
         return
     }
     if (-not (Show-DiscardConfirm -Names @($rows | ForEach-Object { $_.Name }))) { return }
     # Names were already listed and confirmed above, so every row in this
     # batch is sent pre-confirmed.
-    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'Close' -OpNameForApp { param($app) if ($app -eq 'Excel') { 'ExcelClose' } else { 'OutlookClose' } } -ConfirmedDiscard $true
+    $counts = Invoke-BatchOp -Rows $rows -ActionLabel 'Close' -OpKind 'CloseOp' -ConfirmedDiscard $true
     Do-RefreshForApps -Apps @($rows | ForEach-Object { $_.App })
-    [System.Windows.Forms.MessageBox]::Show($script:MainForm, "Closed (discarded): $($counts.Ok)`r`nFailed: $($counts.Failed)", 'Close All and Discard', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    [System.Windows.Forms.MessageBox]::Show($script:MainForm, "Closed: $($counts.Ok)`r`nFailed: $($counts.Failed)", 'Close All and Discard', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 }
 
 function New-MainForm {
     $settings = Get-Settings
-    $script:CurrentFilter = $settings.defaultFilter
+    $script:SelectedApps = @($settings.selectedApps)
 
     # v0.3 test hooks - zero effect unless one of the env vars is set. Read
     # once here for the banner/title; the actual row-dropping happens inside
@@ -1469,7 +1855,8 @@ function New-MainForm {
     $testActive = (-not [string]::IsNullOrEmpty($testFilterPattern)) -or (-not [string]::IsNullOrEmpty($testPidEnv))
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Window Sweeper v0.3'
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9.75)
+    $form.Text = 'Window Sweeper v0.4.0-dev'
     if ($testActive) { $form.Text = $form.Text + ' [TEST]' }
     $form.Width = 920
     $form.Height = 600
@@ -1477,35 +1864,57 @@ function New-MainForm {
     $form.MinimumSize = New-Object System.Drawing.Size(720, 420)
     $form.TopMost = $settings.keepOnTop
 
+    # v0.4 Phase 1: generated once beside the ps1 if missing; try/catch means
+    # a failure anywhere in generation/load just leaves the form without an
+    # icon rather than breaking startup.
+    try {
+        $icoPath = Join-Path $PSScriptRoot 'sweeper.ico'
+        New-SweeperIcoFile -Path $icoPath
+        if (Test-Path $icoPath) { $form.Icon = New-Object System.Drawing.Icon $icoPath }
+    } catch { Write-DebugLog "Window icon EXCEPTION $($_.Exception.Message)" }
+
     $script:TopPanel = New-Object System.Windows.Forms.Panel
     $script:TopPanel.Dock = 'Top'
     $script:TopPanel.Height = 40
 
-    $rbBoth = New-Object System.Windows.Forms.RadioButton
-    $rbBoth.Text = 'Both'; $rbBoth.Location = New-Object System.Drawing.Point(10, 11); $rbBoth.AutoSize = $true
-    $rbExcel = New-Object System.Windows.Forms.RadioButton
-    $rbExcel.Text = 'Excel'; $rbExcel.Location = New-Object System.Drawing.Point(75, 11); $rbExcel.AutoSize = $true
-    $rbOutlook = New-Object System.Windows.Forms.RadioButton
-    $rbOutlook.Text = 'Outlook'; $rbOutlook.Location = New-Object System.Drawing.Point(150, 11); $rbOutlook.AutoSize = $true
-
-    if ($script:CurrentFilter -eq 'Excel') { $rbExcel.Checked = $true }
-    elseif ($script:CurrentFilter -eq 'Outlook') { $rbOutlook.Checked = $true }
-    else { $rbBoth.Checked = $true }
+    # v0.4 Phase 0: per-app checkboxes replace the old Both/Excel/Outlook
+    # radios - Word and Chrome appear now (all four checked by default) even
+    # though their adapters don't land until Phase 2/3; toggling them today
+    # just yields zero rows for that app. Laid out left-to-right using each
+    # checkbox's own preferred width so "Outlook"/"Chrome" never overlap the
+    # next control, rather than guessing fixed pixel gaps.
+    $script:ChkApps = @{}
+    $xPos = 10
+    foreach ($appName in $script:KnownApps) {
+        $chk = New-Object System.Windows.Forms.CheckBox
+        $chk.Text = $appName
+        $chk.AutoSize = $true
+        $chk.Checked = ($script:SelectedApps -contains $appName)
+        $chk.Location = New-Object System.Drawing.Point($xPos, 11)
+        $script:ChkApps[$appName] = $chk
+        $script:TopPanel.Controls.Add($chk)
+        $pref = $chk.GetPreferredSize([System.Drawing.Size]::Empty)
+        $xPos += $pref.Width + 14
+    }
 
     $btnRefresh = New-Object System.Windows.Forms.Button
-    $btnRefresh.Text = 'Refresh'; $btnRefresh.Location = New-Object System.Drawing.Point(240, 7); $btnRefresh.Width = 80
+    $btnRefresh.Text = 'Refresh'; $btnRefresh.Location = New-Object System.Drawing.Point($xPos, 7); $btnRefresh.Width = 80
+    $xPos += $btnRefresh.Width + 20
 
     # Default checked - this is what makes row-click peeking actually usable:
     # the target workbook/email fronts UNDER the sweeper instead of hiding it.
     $chkKeepOnTop = New-Object System.Windows.Forms.CheckBox
-    $chkKeepOnTop.Text = 'Keep on top'; $chkKeepOnTop.Location = New-Object System.Drawing.Point(330, 11); $chkKeepOnTop.AutoSize = $true
+    $chkKeepOnTop.Text = 'Keep on top'; $chkKeepOnTop.Location = New-Object System.Drawing.Point($xPos, 11); $chkKeepOnTop.AutoSize = $true
     $chkKeepOnTop.Checked = $settings.keepOnTop
+    $prefKot = $chkKeepOnTop.GetPreferredSize([System.Drawing.Size]::Empty)
+    $xPos += $prefKot.Width + 20
 
     $script:LblTimestamp = New-Object System.Windows.Forms.Label
-    $script:LblTimestamp.Location = New-Object System.Drawing.Point(460, 12); $script:LblTimestamp.AutoSize = $true
+    $script:LblTimestamp.Location = New-Object System.Drawing.Point($xPos, 12); $script:LblTimestamp.AutoSize = $true
     $script:LblTimestamp.ForeColor = [System.Drawing.Color]::Gray
 
-    $script:TopPanel.Controls.AddRange([System.Windows.Forms.Control[]]@($rbBoth, $rbExcel, $rbOutlook, $btnRefresh, $chkKeepOnTop, $script:LblTimestamp))
+    $script:TopPanel.Controls.AddRange([System.Windows.Forms.Control[]]@($btnRefresh, $chkKeepOnTop, $script:LblTimestamp))
+    Set-FlatButtonStyle -Button $btnRefresh
 
     $script:Banner = New-Object System.Windows.Forms.Panel
     $script:Banner.Dock = 'Top'; $script:Banner.Height = 32
@@ -1521,6 +1930,7 @@ function New-MainForm {
     $script:BtnShowDialog.Location = New-Object System.Drawing.Point(700, 3); $script:BtnShowDialog.Width = 150
 
     $script:Banner.Controls.AddRange([System.Windows.Forms.Control[]]@($script:LblBanner, $script:BtnShowDialog))
+    Set-FlatButtonStyle -Button $script:BtnShowDialog
 
     # v0.3 test filter banner - only built when a test env var is set.
     $testBanner = $null
@@ -1545,6 +1955,11 @@ function New-MainForm {
 
     $script:LblCounts = New-Object System.Windows.Forms.Label
     $script:LblCounts.Location = New-Object System.Drawing.Point(10, 12); $script:LblCounts.AutoSize = $true
+    # Sol P2 (colored text, per plan): a single neutral dark accent rather
+    # than per-app color spans - a plain Label can't paint multi-color runs
+    # without becoming an owner-drawn control, and the per-app breakdown is
+    # already conveyed in the text itself ("12 Excel | 3 Word | ...").
+    $script:LblCounts.ForeColor = [System.Drawing.Color]::FromArgb(51, 51, 51)
 
     # "&&" so the literal ampersand displays (a plain Button, unlike a grid
     # cell, treats a single "&" as a mnemonic-underline prefix and hides it).
@@ -1571,9 +1986,38 @@ function New-MainForm {
     $script:ProgressBar.Visible = $false
 
     $script:BottomPanel.Controls.AddRange([System.Windows.Forms.Control[]]@($script:LblCounts, $btnSaveAll, $btnCloseSaved, $btnCloseDiscard, $script:LblStatus, $script:ProgressBar))
+    Set-FlatButtonStyle -Button $btnSaveAll
+    Set-FlatButtonStyle -Button $btnCloseSaved
+    Set-FlatButtonStyle -Button $btnCloseDiscard
+
+    # v0.4 Phase 1: precreated GDI+ resources for the grid's CellPainting
+    # handler - built once here, per form lifetime, never per-paint. Shared
+    # by every row/cell repaint rather than allocated inside the handler.
+    $script:AccentBrushes = @{
+        'Excel'   = New-HtmlBrush '#217346'
+        'Word'    = New-HtmlBrush '#2B579A'
+        'Outlook' = New-HtmlBrush '#0F6CBD'
+        'Chrome'  = New-HtmlBrush '#F4B400'
+        'Busy'    = New-HtmlBrush '#9E9E9E'
+        'Default' = New-HtmlBrush '#9E9E9E'
+    }
+    $pillFontRegular = New-Object System.Drawing.Font('Segoe UI', 8.25, [System.Drawing.FontStyle]::Regular)
+    $pillFontBold = New-Object System.Drawing.Font('Segoe UI', 8.25, [System.Drawing.FontStyle]::Bold)
+    $script:StatusStyles = @{
+        'UNSAVED'     = @{ Fill = (New-HtmlBrush '#C62828'); Text = [System.Drawing.Brushes]::White; Font = $pillFontBold }
+        'Never saved' = @{ Fill = (New-HtmlBrush '#EF6C00'); Text = [System.Drawing.Brushes]::White; Font = $pillFontRegular }
+        'Saved'       = @{ Fill = (New-HtmlBrush '#E8F5E9'); Text = (New-HtmlBrush '#1B5E20'); Font = $pillFontRegular }
+    }
+    $script:StatusDefaultStyle = @{ Fill = (New-HtmlBrush '#EEEEEE'); Text = (New-HtmlBrush '#555555'); Font = $pillFontRegular }
+    $script:CenterFormat = New-Object System.Drawing.StringFormat
+    $script:CenterFormat.Alignment = [System.Drawing.StringAlignment]::Center
+    $script:CenterFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+    Initialize-AppIcons
 
     $script:Grid = New-Object System.Windows.Forms.DataGridView
     $script:Grid.Dock = 'Fill'
+    $script:Grid.Font = New-Object System.Drawing.Font('Segoe UI', 9.75)
     $script:Grid.AllowUserToAddRows = $false
     $script:Grid.AllowUserToDeleteRows = $false
     $script:Grid.ReadOnly = $true
@@ -1581,7 +2025,30 @@ function New-MainForm {
     $script:Grid.MultiSelect = $false
     $script:Grid.SelectionMode = 'FullRowSelect'
     $script:Grid.AutoSizeColumnsMode = 'Fill'
+    $script:Grid.RowTemplate.Height = 26
+    $script:Grid.ColumnHeadersHeight = 30
+    $script:Grid.EnableHeadersVisualStyles = $false
+    $script:Grid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font('Segoe UI', 9.75, [System.Drawing.FontStyle]::Bold)
+    $script:Grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    $script:Grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+    $script:Grid.ColumnHeadersBorderStyle = 'Single'
+    $script:Grid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(250, 250, 250)
+    $script:Grid.CellBorderStyle = 'SingleHorizontal'
     $script:Grid.AllowUserToResizeRows = $false
+
+    # v0.4 Phase 1: fixed-width icon column, excluded from Fill so it never
+    # competes with the text columns for space. NullValue=$null keeps a row
+    # with no resolved icon (Initialize-AppIcons failure) genuinely blank
+    # instead of WinForms' default broken-image glyph.
+    $colIcon = New-Object System.Windows.Forms.DataGridViewImageColumn
+    $colIcon.Name = 'Icon'; $colIcon.HeaderText = ''
+    $colIcon.Width = 34
+    $colIcon.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::None
+    $colIcon.Resizable = [System.Windows.Forms.DataGridViewTriState]::False
+    $colIcon.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $colIcon.ImageLayout = [System.Windows.Forms.DataGridViewImageCellLayout]::Zoom
+    $colIcon.DefaultCellStyle.NullValue = $null
+    $colIcon.ReadOnly = $true
 
     $colApp = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
     $colApp.Name = 'App'; $colApp.HeaderText = 'App'; $colApp.FillWeight = 55; $colApp.ReadOnly = $true
@@ -1603,7 +2070,98 @@ function New-MainForm {
     $colClose.Name = 'Close'; $colClose.HeaderText = 'Close'; $colClose.FillWeight = 45
     $colClose.UseColumnTextForButtonValue = $false
 
-    $script:Grid.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@($colApp, $colName, $colDetail, $colStatus, $colSave, $colClose))
+    $script:Grid.Columns.AddRange([System.Windows.Forms.DataGridViewColumn[]]@($colIcon, $colApp, $colName, $colDetail, $colStatus, $colSave, $colClose))
+
+    # v0.4 Phase 1: (a) the 4px per-app accent stripe, painted into the icon
+    # column alongside the icon itself; (b) the Status column rendered as a
+    # rounded pill instead of plain text. Every branch is wrapped in the
+    # single outer try/catch - on any exception e.Handled is never set, so
+    # DataGridView falls back to its own default cell painting instead of
+    # leaving a half-drawn cell or crashing the UI thread.
+    # $script:-scoped, not function-local: a plain scriptblock handed to
+    # Add_CellPainting does not reliably close over New-MainForm's own local
+    # variables (confirmed - they read back $null once the event actually
+    # fires, well after New-MainForm has returned), only over $script:/
+    # $global: scope. Every other per-form CellPainting resource above
+    # (AccentBrushes, StatusStyles, CenterFormat, AppIcons) was already
+    # $script:-scoped for the same reason; these two just close the gap.
+    $script:IconColIndex = $script:Grid.Columns['Icon'].Index
+    $script:StatusColIndex = $script:Grid.Columns['Status'].Index
+    $script:Grid.Add_CellPainting({
+        param($s, $e)
+        try {
+            if ($e.RowIndex -lt 0 -or $e.ColumnIndex -lt 0) { return }
+            if ($e.ColumnIndex -eq $script:IconColIndex) {
+                $gridRow = $script:Grid.Rows[$e.RowIndex]
+                $row = $gridRow.Tag
+                $appName = $null; $rowType = $null
+                if ($row) { $appName = $row.App; $rowType = $row.RowType }
+                $accent = $script:AccentBrushes['Default']
+                if ($rowType -eq 'Busy' -or $rowType -eq 'Info') {
+                    $accent = $script:AccentBrushes['Busy']
+                } elseif ($appName -and $script:AccentBrushes.ContainsKey($appName)) {
+                    $accent = $script:AccentBrushes[$appName]
+                }
+                $e.PaintBackground($e.CellBounds, $true)
+                $stripeRect = New-Object System.Drawing.Rectangle($e.CellBounds.X, $e.CellBounds.Y, 4, $e.CellBounds.Height)
+                $e.Graphics.FillRectangle($accent, $stripeRect)
+                $img = $e.Value
+                if ($img) {
+                    $imgSize = 20
+                    $availX = $e.CellBounds.X + 4
+                    $availW = $e.CellBounds.Width - 4
+                    $drawX = $availX + [int](($availW - $imgSize) / 2)
+                    $drawY = $e.CellBounds.Y + [int](($e.CellBounds.Height - $imgSize) / 2)
+                    $e.Graphics.DrawImage($img, $drawX, $drawY, $imgSize, $imgSize)
+                }
+                $e.Handled = $true
+                return
+            }
+            if ($e.ColumnIndex -eq $script:StatusColIndex) {
+                $statusText = ''
+                if ($e.Value) { $statusText = "$($e.Value)" }
+                $style = $script:StatusDefaultStyle
+                if ($script:StatusStyles.ContainsKey($statusText)) { $style = $script:StatusStyles[$statusText] }
+                $e.PaintBackground($e.CellBounds, $true)
+                $textSize = $e.Graphics.MeasureString($statusText, $style.Font)
+                $padX = 10; $padY = 3
+                $pillW = [Math]::Min($e.CellBounds.Width - 6, [int]$textSize.Width + $padX * 2)
+                $pillH = [Math]::Min($e.CellBounds.Height - 6, [int]$textSize.Height + $padY * 2)
+                if ($pillW -lt 1) { $pillW = 1 }
+                if ($pillH -lt 1) { $pillH = 1 }
+                $pillX = $e.CellBounds.X + [int](($e.CellBounds.Width - $pillW) / 2)
+                $pillY = $e.CellBounds.Y + [int](($e.CellBounds.Height - $pillH) / 2)
+                $pillRect = New-Object System.Drawing.Rectangle($pillX, $pillY, $pillW, $pillH)
+                $radius = [Math]::Max(2, [Math]::Min(9, [int]($pillH / 2)))
+                $path = New-RoundedRectPath -Rect $pillRect -Radius $radius
+                $oldMode = $e.Graphics.SmoothingMode
+                # try/finally so a throw from FillPath/DrawString (caught by
+                # the outer catch, which falls back to default painting)
+                # still disposes $path and restores SmoothingMode instead of
+                # leaking the GDI+ path object and leaving the Graphics in
+                # AntiAlias mode for whatever paints next.
+                try {
+                    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+                    $e.Graphics.FillPath($style.Fill, $path)
+                    # PowerShell's .NET overload binding does not implicitly
+                    # widen a Rectangle to RectangleF the way C# does -
+                    # without this it silently resolves to the
+                    # (string,Font,Brush,PointF,StringFormat) overload
+                    # instead and throws on the argument type mismatch.
+                    $pillRectF = New-Object System.Drawing.RectangleF($pillX, $pillY, $pillW, $pillH)
+                    $e.Graphics.DrawString($statusText, $style.Font, $style.Text, $pillRectF, $script:CenterFormat)
+                } finally {
+                    $path.Dispose()
+                    $e.Graphics.SmoothingMode = $oldMode
+                }
+                $e.Handled = $true
+                return
+            }
+        } catch {
+            Write-DebugLog "CellPainting EXCEPTION col=$($e.ColumnIndex) row=$($e.RowIndex) Message=$($_.Exception.Message) Stack=$($_.ScriptStackTrace)"
+            # e.Handled stays false - DataGridView falls back to default painting.
+        }
+    })
 
     $script:Grid.Add_CellContentClick({
         param($s, $e)
@@ -1651,16 +2209,24 @@ function New-MainForm {
     # only the last row" bug - rows 0..n-1 were hidden UNDER the panels).
     $script:Grid.BringToFront()
 
-    $rbBoth.Add_CheckedChanged({ if ($rbBoth.Checked) { $script:CurrentFilter = 'Both'; Do-FullRefresh } })
-    $rbExcel.Add_CheckedChanged({ if ($rbExcel.Checked) { $script:CurrentFilter = 'Excel'; Do-FullRefresh } })
-    $rbOutlook.Add_CheckedChanged({ if ($rbOutlook.Checked) { $script:CurrentFilter = 'Outlook'; Do-FullRefresh } })
+    # v0.4 Phase 0: identical handler on all four checkboxes - it just
+    # recomputes $script:SelectedApps from whichever boxes are checked right
+    # now, so it does not matter which single checkbox actually fired it.
+    foreach ($appName in $script:KnownApps) {
+        $script:ChkApps[$appName].Add_CheckedChanged({
+            $script:SelectedApps = @($script:KnownApps | Where-Object { $script:ChkApps[$_].Checked })
+            Do-FullRefresh
+        })
+    }
     # Refresh button is the one and only click that always retries Outlook,
     # bypassing an active backoff - every other refresh path respects it.
     $btnRefresh.Add_Click({ Do-FullRefresh -ForceOutlookRetry $true })
     $btnSaveAll.Add_Click({ Invoke-SaveAll })
     $btnCloseSaved.Add_Click({ Invoke-CloseAllSaved })
     $btnCloseDiscard.Add_Click({ Invoke-CloseAllDiscard })
-    $chkKeepOnTop.Add_CheckedChanged({ $script:MainForm.TopMost = $chkKeepOnTop.Checked })
+    # $this = the sender checkbox; a function-local $chkKeepOnTop is NOT visible
+    # inside the handler scriptblock (PS closure gap), so the old form no-op'd.
+    $chkKeepOnTop.Add_CheckedChanged({ $script:MainForm.TopMost = $this.Checked })
     $script:BtnShowDialog.Add_Click({
         $app = $script:BtnShowDialog.Tag
         $procName = 'OUTLOOK'
@@ -1731,7 +2297,7 @@ try {
         $script:ClosingRequested = $true
         try {
             $s = Get-Settings
-            $s.defaultFilter = $script:CurrentFilter
+            $s.selectedApps = $script:SelectedApps
             try { $s.keepOnTop = $script:MainForm.TopMost } catch {}
             Save-Settings -Settings $s
         } catch {
