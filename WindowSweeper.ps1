@@ -126,7 +126,17 @@ public class SweeperWin32
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr hWnd);
 
+    // v0.4.2: row-click fronting maximize fix - IsIconic/IsZoomed let the
+    // caller tell a minimized window from a merely-normal one before
+    // deciding whether to force-restore or force-maximize it.
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
+
     public const int SW_RESTORE = 9;
+    public const int SW_SHOWMAXIMIZED = 3;
     public const uint WM_NULL = 0x0000;
     public const uint WM_CLOSE = 0x0010;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
@@ -1020,7 +1030,16 @@ $script:WorkerScript = {
                 }
                 foreach ($doc in $docs) {
                     try {
-                        $name = $doc.Name
+                        # Nick hit blank-Name rows in the wild: doc.Name can
+                        # come back empty (not throw) for some live document
+                        # states. Never emit a nameless row - skip it with a
+                        # debug breadcrumb either way (throw or empty).
+                        $name = $null
+                        try { $name = $doc.Name } catch {}
+                        if (-not $name) {
+                            Write-DebugLog "EnumWord SKIP-NAMELESS-DOC (doc.Name threw or returned empty)"
+                            continue
+                        }
                         $fullName = $null
                         try { $fullName = $doc.FullName } catch {}
                         $hasPath = $false
@@ -1056,8 +1075,17 @@ $script:WorkerScript = {
                         $pvw = $pvws[$i]
                         $caption = ''
                         try { $caption = $pvw.Caption } catch {}
-                        $srcName = $caption
-                        try { if ($pvw.SourceName) { $srcName = $pvw.SourceName } } catch {}
+                        # Nick hit a generic 'Protected View document'
+                        # placeholder in the wild: .SourceName is not a real
+                        # ProtectedViewWindow property (always threw,
+                        # silently swallowed). .Document.Name (the limited
+                        # Document proxy PVW exposes) is the real filename -
+                        # prefer it; fall back to Caption, then the generic
+                        # placeholder only if both are empty.
+                        $docName = ''
+                        try { $docName = $pvw.Document.Name } catch {}
+                        $srcName = $docName
+                        if (-not $srcName) { $srcName = $caption }
                         if (-not $srcName) { $srcName = 'Protected View document' }
                         $rows += [PSCustomObject]@{
                             App = 'Word'; RowType = 'ProtectedView'; Name = $srcName; Detail = 'read-only preview'; Status = 'Protected View'
@@ -1354,7 +1382,7 @@ $script:WorkerScript = {
                     if (-not $postPath -or -not $postSaved) {
                         return @{ Ok = $false; Message = 'Save did not complete - document kept open' }
                     }
-                    $doc.Close(0)
+                    $doc.Close([ref]0)
                     return @{ Ok = $true; Message = 'Saved and closed' }
                 } catch { return @{ Ok = $false; Message = $_.Exception.Message } }
             }
@@ -1393,7 +1421,7 @@ $script:WorkerScript = {
                     if (-not $postPath -or -not $postSaved) {
                         return @{ Ok = $false; Message = 'Save did not complete - document kept open' }
                     }
-                    $doc.Close(0)
+                    $doc.Close([ref]0)
                     return @{ Ok = $true; Message = 'Saved and closed' }
                 } catch { return @{ Ok = $false; Message = $_.Exception.Message } }
             }
@@ -1418,7 +1446,7 @@ $script:WorkerScript = {
                 if ($liveUnsaved -and -not $cmd.ConfirmedDiscard) {
                     return @{ Ok = $false; NeedsConfirm = $true; Message = 'Has unsaved changes' }
                 }
-                try { $doc.Close(0); return @{ Ok = $true; Message = 'Closed without saving' } }  # wdDoNotSaveChanges, promptless
+                try { $doc.Close([ref]0); return @{ Ok = $true; Message = 'Closed without saving' } }  # wdDoNotSaveChanges, promptless
                 catch { return @{ Ok = $false; Message = $_.Exception.Message } }
             }
 
@@ -2374,7 +2402,17 @@ function Invoke-RowActivate {
                 }
             }
         }
-        [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null
+        # Nick hit a degenerate tiny-bar restore rect on Excel/Word (SDI
+        # windows sometimes carry a junk restore rectangle) - unconditional
+        # SW_RESTORE landed there. Excel/Word now always come up maximized;
+        # Outlook/Chrome are left at whatever size they already are and
+        # only un-minimized if actually minimized (never force-resized).
+        if ($Row.App -eq 'Excel' -or $Row.App -eq 'Word') {
+            if ([SweeperWin32]::IsIconic($h)) { [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null }
+            [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_SHOWMAXIMIZED) | Out-Null
+        } elseif ([SweeperWin32]::IsIconic($h)) {
+            [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null
+        }
         [SweeperWin32]::SetForegroundWindow($h) | Out-Null
         return
     }
