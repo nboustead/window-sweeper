@@ -83,6 +83,19 @@ public class WinInfo
 
 public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
+// v0.4.2: multi-monitor fronting - land the target window on a different
+// monitor than the sweeper itself when more than one exists.
+public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+public struct MONITORINFO {
+    public uint cbSize;
+    public RECT rcMonitor;
+    public RECT rcWork;
+    public uint dwFlags;
+}
+
+public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
+
 public class SweeperWin32
 {
     [DllImport("user32.dll")]
@@ -135,12 +148,45 @@ public class SweeperWin32
     [DllImport("user32.dll")]
     public static extern bool IsZoomed(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("user32.dll")]
+    public static extern int GetSystemMetrics(int nIndex);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
     public const int SW_RESTORE = 9;
     public const int SW_SHOWMAXIMIZED = 3;
     public const uint WM_NULL = 0x0000;
     public const uint WM_CLOSE = 0x0010;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
+    public const uint MONITOR_DEFAULTTONEAREST = 2;
+    public const int SM_CMONITORS = 80;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOZORDER = 0x0004;
     private const uint OBJID_NATIVEOM = 0xFFFFFFF0;
+
+    // Same "enumerate in C#, not a PS scriptblock delegate" reasoning as
+    // GetTopLevelWindows - the callback must not be GC'd mid-enumeration.
+    public static List<IntPtr> GetAllMonitors()
+    {
+        List<IntPtr> result = new List<IntPtr>();
+        MonitorEnumProc cb = delegate(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData)
+        {
+            result.Add(hMonitor);
+            return true;
+        };
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+        return result;
+    }
 
     // Enumeration lives in C#, not a PowerShell scriptblock delegate, so the
     // callback cannot be garbage-collected mid-enumeration.
@@ -777,6 +823,17 @@ $script:WorkerScript = {
         return @{ Kind = 'SubjectIndex'; Subject = $subj; MessageClass = $mc; Index = $idx }
     }
 
+    # Nick hit Outlook rows that never front on click: Inspector.Caption and
+    # the live rctrl_renwnd32 window title often carry trailing/doubled
+    # spaces that don't line up character-for-character even though they
+    # are "the same" window. Trim + collapse whitespace runs before any
+    # comparison, on both sides.
+    function Get-NormalizedTitle {
+        param([string]$Text)
+        if (-not $Text) { return '' }
+        return ($Text.Trim() -replace '\s+', ' ')
+    }
+
     # Returns @{ Item = <resolved item or $null>; Ambiguous = <bool> } rather
     # than a bare item, so callers can tell "not found" (report "no longer
     # open") apart from "more than one live item looks the same and the
@@ -1132,8 +1189,9 @@ $script:WorkerScript = {
                     try {
                         $item = $inspectors[$i].CurrentItem
                         if (-not $item) { continue }
-                        $subj = ''
-                        try { $subj = $item.Subject } catch {}
+                        $rawSubj = ''
+                        try { $rawSubj = $item.Subject } catch {}
+                        $subj = $rawSubj
                         if (-not $subj) { $subj = '(no subject)' }
                         $mc = ''
                         try { $mc = $item.MessageClass } catch {}
@@ -1150,8 +1208,21 @@ $script:WorkerScript = {
                         $caption = ''
                         try { $caption = $inspectors[$i].Caption } catch {}
                         if ($caption) {
-                            $capMatches = @($inspWins | Where-Object { $_.Title -eq $caption -or $_.Title.StartsWith($caption) })
+                            $normCaption = Get-NormalizedTitle $caption
+                            $capMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normCaption })
                             if ($capMatches.Count -eq 1) { $hwndVal = $capMatches[0].Hwnd.ToInt64() }
+                        }
+                        # Fallback: a unique window title starting with the
+                        # item's own (normalized) Subject - only when the
+                        # caption match above was not unique and there is a
+                        # real subject to key on. Still ambiguous -> Hwnd=0,
+                        # same as today; never guess.
+                        if ($hwndVal -eq 0 -and $rawSubj) {
+                            $normSubj = Get-NormalizedTitle $rawSubj
+                            if ($normSubj) {
+                                $subjMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title).StartsWith($normSubj) })
+                                if ($subjMatches.Count -eq 1) { $hwndVal = $subjMatches[0].Hwnd.ToInt64() }
+                            }
                         }
                         $rows += [PSCustomObject]@{
                             App = 'Outlook'; RowType = 'Inspector'; Name = $subj; Detail = $mc; Status = $status
@@ -1171,9 +1242,19 @@ $script:WorkerScript = {
                         try { $folderName = $exp.CurrentFolder.Name } catch {}
                         $detail = ''
                         if ($folderName) { $detail = "Folder: $folderName" }
+                        # Same normalized-caption match as Inspectors -
+                        # Explorer (folder) windows share the rctrl_renwnd32
+                        # class. No Subject-style fallback (Explorer has no
+                        # equivalent); ambiguous or no match -> Hwnd=0.
+                        $expHwndVal = 0
+                        $normExpCaption = Get-NormalizedTitle $caption
+                        if ($normExpCaption) {
+                            $expMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normExpCaption })
+                            if ($expMatches.Count -eq 1) { $expHwndVal = $expMatches[0].Hwnd.ToInt64() }
+                        }
                         $rows += [PSCustomObject]@{
                             App = 'Outlook'; RowType = 'Explorer'; Name = $caption; Detail = $detail; Status = 'Window'
-                            Key = @{ Kind = 'Index'; Index = $i; VerifyCaption = $caption }; Hwnd = 0; CanSave = $false; CanClose = $true
+                            Key = @{ Kind = 'Index'; Index = $i; VerifyCaption = $caption }; Hwnd = $expHwndVal; CanSave = $false; CanClose = $true
                         }
                     } catch { continue }
                 }
@@ -2402,12 +2483,44 @@ function Invoke-RowActivate {
                 }
             }
         }
+        # v0.4.2: land the fronted window on a DIFFERENT monitor than the
+        # sweeper itself when more than one exists - a fronted window
+        # landing on the same screen as (behind/under) the sweeper was
+        # Nick's complaint. Single monitor -> this block is inert.
+        try {
+            if ([SweeperWin32]::GetSystemMetrics([SweeperWin32]::SM_CMONITORS) -gt 1 -and $script:MainForm) {
+                $sweeperMonitor = [SweeperWin32]::MonitorFromWindow($script:MainForm.Handle, [SweeperWin32]::MONITOR_DEFAULTTONEAREST)
+                $targetMonitor = [SweeperWin32]::MonitorFromWindow($h, [SweeperWin32]::MONITOR_DEFAULTTONEAREST)
+                if ($targetMonitor -eq $sweeperMonitor) {
+                    $otherMonitor = [SweeperWin32]::GetAllMonitors() | Where-Object { $_ -ne $sweeperMonitor } | Select-Object -First 1
+                    if ($otherMonitor) {
+                        $mi = New-Object MONITORINFO
+                        # Marshal.SizeOf([Type]) resolves ambiguously in PS
+                        # 5.1 (tries to marshal the RuntimeType itself and
+                        # throws) - pass the instance, not the type.
+                        $mi.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($mi)
+                        if ([SweeperWin32]::GetMonitorInfo($otherMonitor, [ref]$mi)) {
+                            # Un-maximize first - SetWindowPos on a maximized
+                            # window does not usefully relocate it.
+                            if ([SweeperWin32]::IsZoomed($h)) { [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null }
+                            [SweeperWin32]::SetWindowPos($h, [IntPtr]::Zero, $mi.rcWork.Left, $mi.rcWork.Top, 0, 0, ([SweeperWin32]::SWP_NOSIZE -bor [SweeperWin32]::SWP_NOZORDER)) | Out-Null
+                        }
+                    }
+                }
+                # Already on a different monitor - leave position alone,
+                # only the show-behavior below applies.
+            }
+        } catch { Write-DebugLog "Invoke-RowActivate MONITOR-MOVE EXCEPTION $($_.Exception.Message)" }
+
         # Nick hit a degenerate tiny-bar restore rect on Excel/Word (SDI
         # windows sometimes carry a junk restore rectangle) - unconditional
-        # SW_RESTORE landed there. Excel/Word now always come up maximized;
-        # Outlook/Chrome are left at whatever size they already are and
-        # only un-minimized if actually minimized (never force-resized).
-        if ($Row.App -eq 'Excel' -or $Row.App -eq 'Word') {
+        # SW_RESTORE landed there. Excel/Word AND Outlook Inspector rows
+        # (Nick wants Outlook to behave like Excel) now always come up
+        # maximized; Chrome and Outlook Explorer (folder) rows are left at
+        # whatever size they already are and only un-minimized if actually
+        # minimized (never force-resized).
+        $shouldMaximize = ($Row.App -eq 'Excel') -or ($Row.App -eq 'Word') -or ($Row.App -eq 'Outlook' -and $Row.RowType -eq 'Inspector')
+        if ($shouldMaximize) {
             if ([SweeperWin32]::IsIconic($h)) { [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_RESTORE) | Out-Null }
             [SweeperWin32]::ShowWindow($h, [SweeperWin32]::SW_SHOWMAXIMIZED) | Out-Null
         } elseif ([SweeperWin32]::IsIconic($h)) {
