@@ -1,2 +1,9 @@
 /release/
 /*.zip
+node_modules/
+.env
+.env.*
+cookies*.txt
+*cookies*
+*.cookies
+.credentials.json
