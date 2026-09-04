@@ -96,6 +96,17 @@ public struct MONITORINFO {
 
 public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdcMonitor, ref RECT lprcMonitor, IntPtr dwData);
 
+// v0.4.2: Outlook Inspector/Explorer COM objects implement IOleWindow -
+// querying it directly for the real HWND replaces caption-title matching
+// entirely (caption matching could never disambiguate two windows with an
+// identical title, e.g. two blank '(no subject)' drafts).
+[ComImport, Guid("00000114-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IOleWindow
+{
+    void GetWindow(out IntPtr hwnd);
+    void ContextSensitiveHelp(bool fEnterMode);
+}
+
 public class SweeperWin32
 {
     [DllImport("user32.dll")]
@@ -227,6 +238,25 @@ public class SweeperWin32
         int hr = AccessibleObjectFromWindow(excel7, OBJID_NATIVEOM, ref iidDispatch, ref ppv);
         if (hr != 0) return null;
         return ppv;
+    }
+
+    // Outlook Inspector/Explorer -> IOleWindow.GetWindow() -> the exact
+    // HWND for that specific COM object, no title guessing. Any failure
+    // (object does not support IOleWindow, RPC error, etc.) -> Zero.
+    public static IntPtr GetOleWindowHandle(object comObj)
+    {
+        try
+        {
+            IOleWindow oleWindow = comObj as IOleWindow;
+            if (oleWindow == null) return IntPtr.Zero;
+            IntPtr hwnd;
+            oleWindow.GetWindow(out hwnd);
+            return hwnd;
+        }
+        catch
+        {
+            return IntPtr.Zero;
+        }
     }
 }
 "@
@@ -813,14 +843,14 @@ $script:WorkerScript = {
     # uses the Index only to break a tie when Subject+MessageClass alone
     # matches more than one live inspector (e.g. two blank compose windows).
     function Get-ItemKey {
-        param($item, $idx)
+        param($item, $idx, [int64]$Hwnd = 0)
         $entryId = $null
         try { $entryId = $item.EntryID } catch {}
-        if ($entryId) { return @{ Kind = 'EntryID'; Value = $entryId } }
+        if ($entryId) { return @{ Kind = 'EntryID'; Value = $entryId; Hwnd = $Hwnd } }
         $subj = $null; $mc = $null
         try { $subj = $item.Subject } catch {}
         try { $mc = $item.MessageClass } catch {}
-        return @{ Kind = 'SubjectIndex'; Subject = $subj; MessageClass = $mc; Index = $idx }
+        return @{ Kind = 'SubjectIndex'; Subject = $subj; MessageClass = $mc; Index = $idx; Hwnd = $Hwnd }
     }
 
     # Nick hit Outlook rows that never front on click: Inspector.Caption and
@@ -842,6 +872,24 @@ $script:WorkerScript = {
     function Resolve-Inspector {
         param($ol, $key)
         $inspectors = @($ol.Inspectors)
+        # Hwnd-based match first (exact, unique by construction via
+        # IOleWindow) - this is what lets two identical-looking drafts
+        # (same blank Subject, no EntryID yet) be individually targeted,
+        # which EntryID/SubjectIndex alone cannot do. If the hwnd no longer
+        # matches any live inspector (window closed, or a key predating
+        # this fix carries no Hwnd), fall through to the existing chain -
+        # every prior fallback still applies.
+        if ($key.Hwnd) {
+            for ($i = 0; $i -lt $inspectors.Count; $i++) {
+                $liveHwnd = [IntPtr]::Zero
+                try { $liveHwnd = [SweeperWin32]::GetOleWindowHandle($inspectors[$i]) } catch {}
+                if ($liveHwnd -ne [IntPtr]::Zero -and $liveHwnd.ToInt64() -eq $key.Hwnd) {
+                    $item = $null
+                    try { $item = $inspectors[$i].CurrentItem } catch { continue }
+                    if ($item) { return @{ Item = $item; Ambiguous = $false } }
+                }
+            }
+        }
         if ($key.Kind -eq 'EntryID') {
             for ($i = 0; $i -lt $inspectors.Count; $i++) {
                 $item = $null
@@ -1204,29 +1252,41 @@ $script:WorkerScript = {
                         try { if ($item.PSObject.Properties.Match('Saved').Count -gt 0) { $saved = [bool]$item.Saved } } catch {}
                         $status = 'Saved'
                         if (-not $saved) { $status = 'UNSAVED' }
+                        # Primary: IOleWindow.GetWindow() on the Inspector
+                        # itself - the exact HWND for THIS object, no title
+                        # guessing. This is what makes identical-looking
+                        # windows (two blank '(no subject)' drafts) resolve
+                        # distinctly, which caption/title matching never
+                        # could. Falls back to the old normalized-caption /
+                        # Subject-prefix matching only if IOleWindow itself
+                        # returns nothing (e.g. an odd item type).
                         $hwndVal = 0
-                        $caption = ''
-                        try { $caption = $inspectors[$i].Caption } catch {}
-                        if ($caption) {
-                            $normCaption = Get-NormalizedTitle $caption
-                            $capMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normCaption })
-                            if ($capMatches.Count -eq 1) { $hwndVal = $capMatches[0].Hwnd.ToInt64() }
-                        }
-                        # Fallback: a unique window title starting with the
-                        # item's own (normalized) Subject - only when the
-                        # caption match above was not unique and there is a
-                        # real subject to key on. Still ambiguous -> Hwnd=0,
-                        # same as today; never guess.
-                        if ($hwndVal -eq 0 -and $rawSubj) {
-                            $normSubj = Get-NormalizedTitle $rawSubj
-                            if ($normSubj) {
-                                $subjMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title).StartsWith($normSubj) })
-                                if ($subjMatches.Count -eq 1) { $hwndVal = $subjMatches[0].Hwnd.ToInt64() }
+                        try {
+                            $oleHwnd = [SweeperWin32]::GetOleWindowHandle($inspectors[$i])
+                            if ($oleHwnd -ne [IntPtr]::Zero) { $hwndVal = $oleHwnd.ToInt64() }
+                        } catch {}
+                        if ($hwndVal -eq 0) {
+                            $caption = ''
+                            try { $caption = $inspectors[$i].Caption } catch {}
+                            if ($caption) {
+                                $normCaption = Get-NormalizedTitle $caption
+                                $capMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normCaption })
+                                if ($capMatches.Count -eq 1) { $hwndVal = $capMatches[0].Hwnd.ToInt64() }
+                            }
+                            # Last-resort fallback: a unique window title
+                            # starting with the item's own (normalized)
+                            # Subject. Still ambiguous -> Hwnd=0; never guess.
+                            if ($hwndVal -eq 0 -and $rawSubj) {
+                                $normSubj = Get-NormalizedTitle $rawSubj
+                                if ($normSubj) {
+                                    $subjMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title).StartsWith($normSubj) })
+                                    if ($subjMatches.Count -eq 1) { $hwndVal = $subjMatches[0].Hwnd.ToInt64() }
+                                }
                             }
                         }
                         $rows += [PSCustomObject]@{
                             App = 'Outlook'; RowType = 'Inspector'; Name = $subj; Detail = $mc; Status = $status
-                            Key = (Get-ItemKey $item $i); Hwnd = $hwndVal; CanSave = (-not $isReport); CanClose = $true
+                            Key = (Get-ItemKey $item $i $hwndVal); Hwnd = $hwndVal; CanSave = (-not $isReport); CanClose = $true
                         }
                     } catch { continue }
                 }
@@ -1242,15 +1302,24 @@ $script:WorkerScript = {
                         try { $folderName = $exp.CurrentFolder.Name } catch {}
                         $detail = ''
                         if ($folderName) { $detail = "Folder: $folderName" }
-                        # Same normalized-caption match as Inspectors -
-                        # Explorer (folder) windows share the rctrl_renwnd32
-                        # class. No Subject-style fallback (Explorer has no
-                        # equivalent); ambiguous or no match -> Hwnd=0.
+                        # Primary: IOleWindow.GetWindow() on the Explorer
+                        # itself, same as Inspectors. Falls back to
+                        # normalized-caption match (Explorer windows share
+                        # the rctrl_renwnd32 class; no Subject-style
+                        # fallback - Explorer has no equivalent) only if
+                        # IOleWindow returns nothing; ambiguous/no match ->
+                        # Hwnd=0.
                         $expHwndVal = 0
-                        $normExpCaption = Get-NormalizedTitle $caption
-                        if ($normExpCaption) {
-                            $expMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normExpCaption })
-                            if ($expMatches.Count -eq 1) { $expHwndVal = $expMatches[0].Hwnd.ToInt64() }
+                        try {
+                            $expOleHwnd = [SweeperWin32]::GetOleWindowHandle($exp)
+                            if ($expOleHwnd -ne [IntPtr]::Zero) { $expHwndVal = $expOleHwnd.ToInt64() }
+                        } catch {}
+                        if ($expHwndVal -eq 0) {
+                            $normExpCaption = Get-NormalizedTitle $caption
+                            if ($normExpCaption) {
+                                $expMatches = @($inspWins | Where-Object { (Get-NormalizedTitle $_.Title) -eq $normExpCaption })
+                                if ($expMatches.Count -eq 1) { $expHwndVal = $expMatches[0].Hwnd.ToInt64() }
+                            }
                         }
                         $rows += [PSCustomObject]@{
                             App = 'Outlook'; RowType = 'Explorer'; Name = $caption; Detail = $detail; Status = 'Window'
